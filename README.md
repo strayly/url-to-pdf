@@ -1,278 +1,225 @@
-# url-to-pdf MCP
+# url-to-pdf-mcp
 
-把任意公开网页转成 **PDF / 截图 / Markdown**，购买 **API key** 后调用，付款走 **Paddle**（支持 sandbox 测试，不接真实收款也能验全链路）。
+把任意**公开网页**转换为 **PDF / 整页截图 / Markdown** 的 MCP server 与 HTTP API。
+通过 Paddle 购买 API key 后调用，无需自建浏览器渲染环境。
 
-没有后台、没有数据库依赖。用户付款 → Paddle 发 webhook → Worker 自动签发 API key 存进 KV → 用户凭邮箱领回 → 之后调用带 `x-api-key` 即可。
-
-线上地址（已部署）：`https://url-to-pdf-mcp.1398088827.workers.dev`
-
----
-
-## 设计思路（先看这个，别急着部署）
-
-**为什么 MCP 层和 HTTP 层是分开的？**
-
-Paddle 是「买 key 再调用」模型，不是按次微支付。所以这里分工是：
-
-```
-/mcp          负责「发现」  tools/list 免费，告诉 agent 有什么、多少钱、去哪买 key
-/tools/*      负责「成交」  被 API-key 鉴权保护，无 key 返回 401
-/buy          负责「收银」  调 Paddle API 建交易，302 跳转到 Paddle 结账页
-/webhook/paddle  负责「发卡」  Paddle 付款完成后回调这里，验签后自动签发 key
-/portal/claim     负责「领取」  用户凭结账邮箱取回自己的 key
-```
-
-**为什么返回一个下载 URL，而不是把 PDF 直接塞回去？**
-
-大文件塞进 tool result 会直接撑爆模型上下文。产物存 KV（1 小时 TTL），返回下载链接。
-
-**存储为什么用 KV 而不是 R2？**
-
-KV 不需要在 Cloudflare 控制台单独开启，部署即通；R2 需要先去控制台点一下启用（本机当时没开）。KV 单值上限 25MB，覆盖绝大多数页面。上量后想更便宜可以只改 `src/env.ts` 里 `ASSETS` 的类型 + `src/index.ts` 两处 put/get + `wrangler.jsonc`（换回 R2 Bucket）。
+- 标准 MCP server，兼容 Claude Desktop、Cursor 等支持 tool-calling 的客户端
+- 原生 HTTP API，便于脚本、服务端、低代码平台直接调用
+- SSRF 防护：仅允许公网 http(s) 地址，拦截内网/保留网段
+- 基于 Paddle 的订阅制授权，付款后自动发卡
 
 ---
 
-## 定价
+## 线上实例
 
-订阅制，写在 `wrangler.jsonc` 的 `PRICE_*` vars 里（纯展示文案）。真实价格由 Paddle 后台的 **Price ID** 决定，写进 `PADDLE_PRICE_ID`：
+已部署公开实例，可直接使用，无需自建：
 
-| 工具 | 计划 |
-|---|---|
-| `url_to_pdf` | Plan $5/mo（含全部工具） |
-| `url_to_screenshot` | 同上 |
-| `url_to_markdown` | 同上 |
-| `list_capabilities` | 免费 |
+```
+https://url-to-pdf-mcp.1398088827.workers.dev
+```
 
 ---
 
-## Paddle 后台配置清单（sandbox）
+## 获取 API key
 
-按顺序做，缺一步 `/buy` 就会报错。
-
-### 1. 建 Product
-
-Catalog → Products → New product：
-
-| 字段 | 填什么 | 说明 |
-|---|---|---|
-| Product name | `URL to PDF MCP` | 结账页与收据上买家看到的名字 |
-| Tax category | `Standard digital goods`（保持默认） | **不要选 SaaS**：该分类需 Paddle 审核你的网站，本项目没有落地页，会被拒 |
-| Description | `MCP server: render a web page to PDF / full-page screenshot / clean Markdown. All tools included.` | 仅后台内部可见 |
-| Product icon URL | 留空 | 需要公网 HTTPS 图片地址才有效 |
-| Custom Data | `product` = `url-to-pdf-mcp` | 可选，会带进 webhook，多 server 时便于区分 |
-
-保存后拿到 `pro_...` —— **代码里不用它**，别填错。
-
-### 2. 建 Price（在该产品下 Add price）
-
-| 字段 | 填什么 | 说明 |
-|---|---|---|
-| Price name | `Pro — monthly` | 结账页与发票上买家看到的名称 |
-| Internal description | `Pro monthly, all 3 tools (url_to_pdf / url_to_screenshot / url_to_markdown)` | **Paddle 必填项**，仅后台可见，不影响买家 |
-| Pricing model | **`Recurring`** | **必须选 Recurring，不要 One-time。** 定价是 $5/月；买断等于一次性收完就断收入，而每次调用都在消耗 Browser Rendering；且 `pay.ts` 里 `subscription.updated` → 非 active 停卡的逻辑永不触发 |
-| Billing period | `Monthly`，frequency `1` | 切到 Recurring 后才会出现该字段 —— 看不到它，说明还停在 One-time |
-| Base price | `5.00`，货币 `USD` | 与 `wrangler.jsonc` 的 `PRICE_*` 展示价 `$5/mo` 对齐 |
-| Sales tax | `Account default` | 继承 Product 上设的 Standard digital goods，不用在这里再选 |
-| Min / Max quantity | `1` / `999999`（保持默认） | 供按席位计价与阶梯折扣用，单人订阅无需改 |
-| Custom Data | `product` = `url-to-pdf-mcp` | 可选，会带进 webhook，日后多个 server 时区分来源 |
-
-保存后拿到 `pri_...` —— **把这个填进 `wrangler.jsonc` 的 `PADDLE_PRICE_ID`**，然后 `npx wrangler deploy`。
-
-> **Price 的金额、币种、计费周期一经创建不可编辑**（Paddle 的设计，因为上面可能已挂订阅）。选错了只能删掉重建 —— 若那时已有人订阅，会牵连现有买家。所以 Pricing model 这一步务必当场选对。
-
-### 3. 设 Default payment link（必做，最容易漏）
-
-Paddle → Checkout → Checkout settings → Default payment link。
-
-不设的话，调 `POST /transactions` 会直接返回：
-
-```json
-{"error":{"type":"request_error","code":"transaction_default_checkout_url_not_set",
- "detail":"A Default Payment Link has not yet been defined within the Paddle Dashboard"}}
-```
-
-sandbox 阶段填 `http://localhost` 或任意测试域名即可；**转生产前必须换成已通过 Paddle 网站审核的域名**。
-
-> ⚠️ **本项目的 `/buy` 不依赖这个默认链接**。默认 payment link 是**账号级**的，本账号它指向别的产品的付款页（那个页面写死了自己的商品、不读 `_ptxn`），所以我们会把用户跳到**本站自有收银台** `/checkout`，用它拉起真正属于本产品的交易。Paddle 侧仍要求"存在一个默认 payment link"才能建交易，所以这一项照样得设，只是它不再决定本产品的结账页。
-
-### 3.5 自有收银台：Client-side token + 域名审批
-
-`/checkout` 是一张本站页面，用 Paddle.js 按 `_ptxn` 拉起对应交易的结账浮层。它需要：
-
-| 放到哪 | 从哪拿 | 格式特征 |
-|---|---|---|
-| `PADDLE_CLIENT_TOKEN`（vars） | 直链 `.../authentication-v2` → **Client-side tokens** 标签 → `New client-side token` | `test_...`（sandbox）/ `live_...`（生产）。本就用于前端，放 vars 不敏感 |
-| 域名审批 | Paddle → `Checkout` → `Website approval`，加入本站域名 | **sandbox 自动秒批**；生产需人工审核，未过审时 `PATCH /transactions/{id}` 设 `checkout.url` 会 400（不影响付款主流程） |
-
-配好后 `/checkout` 才可用；未配 `PADDLE_CLIENT_TOKEN` 时它返回 503。
-
-### 4. 取 sandbox 凭据
-
-**先确认在哪个后台**：sandbox 与生产是**两个独立注册的站点**——
-sandbox 是 `sandbox-vendors.paddle.com`，生产是 `vendors.paddle.com`。
-sandbox 的 Product / Price / key 在生产后台**根本看不到**，反之亦然。
-
-| 放到哪 | 从哪拿 | 格式特征 |
-|---|---|---|
-| `PADDLE_API_KEY`（secret） | 直链 `.../authentication-v2` → API keys 页 → `New API key`（侧栏已无此入口，见下方说明） | 69 字符，`pdl_sdbx_apikey_...`（sandbox）/ `pdl_live_apikey_...`（生产） |
-| `PADDLE_WEBHOOK_SECRET`（secret） | 左侧栏 `Events` → `Notifications` → 打开目标 → 复制 `Signing secret` | `pdl_ntfset_...` |
-| 通知目的地 URL | `https://<你的域名>/webhook/paddle`，至少勾 `transaction.completed`，订阅再勾 `subscription.*` | — |
-
-> ⚠️ **侧栏里找不到 `Developer Tools` 是常态，不要在这上面浪费时间。** Paddle 2026 改版后
-> 侧栏里已经没有这个一级菜单（`Connectors` 下面直接就是 `My account`），旧文档全部过时。
-> **直接用直链**，它会绕过侧栏：
->
-> - sandbox：`https://sandbox-vendors.paddle.com/authentication-v2`
-> - 生产：`https://vendors.paddle.com/authentication-v2`
->
-> 直链进去后就是 API keys 页。另外 `Notifications` 归在侧栏 **Events** 组下（不在 Developer Tools 里）。
-> 直链也打不开（403/跳回首页）→ 检查当前登录账号的角色：只有 **Owner / Admin / Technical**
-> 角色能看到 Authentication，`Finance` / `Support` 等角色看不到。
-
-> ⚠️ **sandbox 与生产是两套完全隔离的系统**：API key、client token、Product、Price、webhook secret、通知目的地都要在两边各建一遍，不能混用。现在 `PADDLE_ENV=sandbox`，所以必须用 sandbox 的 key，否则会 401/找不到商品。
+1. 打开 `https://url-to-pdf-mcp.1398088827.workers.dev/buy` 进入结账页。
+2. 完成订阅付款（Paddle 结账，支持主流信用卡）。
+3. 付款完成后，打开
+   `https://url-to-pdf-mcp.1398088827.workers.dev/portal/claim?email=<你付款用的邮箱>`
+   即可领取你的 API key（`utp_...`）。
 
 ---
 
-## 部署步骤（已替你跑通一遍）
+## 使用方式
 
-### 1. 前置条件
+### 方式一：作为 MCP server（推荐给 AI 客户端）
 
-- **Cloudflare Workers Paid 计划（$5/月）** —— Browser Rendering 免费计划用不了，这是硬门槛
-- Node 20+
-- **Paddle 账号**（免费注册即可；要测真实收款在 sandbox 建商品，见下）
-
-### 2. 装依赖 + 建存储
-
-```bash
-cd url-to-pdf-mcp
-npm install
-# KV 命名空间已建好，id 已写进 wrangler.jsonc：
-#   KEYS  112dbd7e8b994ce6afeab0431f96bb57
-#   ASSETS dc39c0196daa4746b075d93797969b24
-```
-
-### 3. 配置变量 / 密钥
-
-`wrangler.jsonc` 的 vars 里 `PADDLE_PRICE_ID` 与 `PADDLE_CLIENT_TOKEN` 现在是占位符，改成你自己的：
-
-- `PADDLE_PRICE_ID`：在 Paddle 后台建的 Price ID（`pri_...`）
-- `PADDLE_CLIENT_TOKEN`：Paddle 后台 Authentication → Client-side tokens 里的 `test_...`（sandbox）/ `live_...`（生产）
-- `WORKER_ORIGIN`：你的 Worker 域名
-- `PADDLE_ENV`：sandbox 测试填 `sandbox`，生产填 `live`
-
-密钥用 `wrangler secret put`（**不要写进仓库**，已被 `.gitignore` 忽略）：
-
-```bash
-npx wrangler secret put PADDLE_API_KEY        # Paddle 服务端 API key（pdl_...）
-npx wrangler secret put PADDLE_WEBHOOK_SECRET  # Paddle 通知验签密钥（pdl_ntfset_...）
-```
-
-### 4. 部署 + 自检
-
-```bash
-npx wrangler deploy
-node scripts/selfcheck.mjs https://url-to-pdf-mcp.1398088827.workers.dev
-```
-
-**自检一定要跑**——它专门抓最容易踩的坑：付费端点漏配鉴权会直接返回 200 把数据免费送出去。
-
----
-
-## 本地 / sandbox 自测（不接真实收款也能验全链路）
-
-### A. 最快：webhook 自签验签（推荐，无需 Paddle 后台）
-
-webhook 验签是 HMAC 计算，本地就能用 secret 自己签一个假事件打过去，验证「验签 + 自动发卡 + 领取 + 带 key 调用」整条链：
-
-```bash
-# .dev.vars 里放 PADDLE_WEBHOOK_SECRET 后：
-npx wrangler dev --port 8787
-# 另开终端：
-NO_PROXY='localhost,127.0.0.1' BASE=http://127.0.0.1:8787 \
-  PADDLE_WEBHOOK_SECRET=<你的 webhook secret> \
-  node scripts/live-test.mjs
-```
-
-`scripts/live-test.mjs` 一次覆盖：首页、`openapi.json`、tools/list、无 key→401、SSRF→400、webhook 验签+发卡、带 key 渲染、错误签名→401。
-
-### B. 真实 Paddle 结账 + webhook（接真实 sandbox 收款）
-
-1. Paddle sandbox 后台（`sandbox-vendors.paddle.com`）→ 建 **Product + Price**（$5/月），复制 **Price ID**（`pri_...`）
-2. 直链 `https://sandbox-vendors.paddle.com/authentication-v2` → API keys 页 → `New API key`（server-side，得到 `pdl_sdbx_apikey_...`）
-3. 侧栏 `Events` → `Notifications` → 新建 destination，URL 填 `https://<你的域名>/webhook/paddle`，保存后复制 **Signing secret**（`pdl_ntfset_...`）
-4. 把这三样写进 Worker（见上方「配置变量 / 密钥」），然后 `npx wrangler deploy`
-5. 测结账：`https://<你的域名>/buy` → 302 跳 Paddle 结账页
-6. 真实付款（sandbox 测试卡）后 Paddle 自动回调 `/webhook/paddle` → 自动发卡
-7. 领 key：`https://<你的域名>/portal/claim?email=<结账邮箱>`
-
-> ⚠️ Paddle 2026 改版后没有显眼的「Send example notification」按钮，验证 webhook 直接走**真实 sandbox 结账**即可，比测试事件更可信。
-
----
-
-## 接入方式
-
-### 作为 MCP server（agent 用）
+在 Claude Desktop / Cursor 等客户端的 MCP 配置中加入：
 
 ```json
 {
   "mcpServers": {
     "url-to-pdf": {
       "command": "npx",
-      "args": ["mcp-remote", "https://url-to-pdf-mcp.1398088827.workers.dev/mcp", "--header", "x-api-key: YOUR_KEY"]
+      "args": [
+        "mcp-remote",
+        "https://url-to-pdf-mcp.1398088827.workers.dev/mcp",
+        "--header", "x-api-key: YOUR_API_KEY"
+      ]
     }
   }
 }
 ```
 
-### 作为 HTTP API（脚本/服务用）
+连接后可直接用自然语言调用，例如「把 https://example.com 转成 PDF」。
+
+### 方式二：作为 HTTP API（推荐给脚本 / 服务端）
+
+所有渲染走 `POST /tools/*`，请求头带 `x-api-key`：
 
 ```bash
+# 网页转 PDF
 curl -X POST https://url-to-pdf-mcp.1398088827.workers.dev/tools/url-to-pdf \
-  -H "Content-Type: application/json" -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
   -d '{"url":"https://example.com","format":"A4"}'
-# → 200 + downloadUrl（1 小时有效）
+
+# 整页截图
+curl -X POST https://url-to-pdf-mcp.1398088827.workers.dev/tools/url-to-screenshot \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{"url":"https://example.com","fullPage":true,"format":"png"}'
+
+# 提取 Markdown
+curl -X POST https://url-to-pdf-mcp.1398088827.workers.dev/tools/url-to-markdown \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{"url":"https://example.com"}'
+```
+
+返回 JSON 含 `downloadUrl`（有效期 1 小时），再下载即可：
+
+```bash
+curl -O "<downloadUrl>"
 ```
 
 ---
 
-## 发布到 MCP 目录
+## API 参考
 
-按顺序，官方 Registry 是数据源，其他会自动同步（2026-10 实测）：
+### 工具 / 端点对照
 
+| MCP 工具名 | HTTP 端点 | 说明 |
+|---|---|---|
+| `list_capabilities` | `GET /openapi.json` | 免费。列出能力、价格与购买入口 |
+| `url_to_pdf` | `POST /tools/url-to-pdf` | 网页转 PDF |
+| `url_to_screenshot` | `POST /tools/url-to-screenshot` | 整页截图 |
+| `url_to_markdown` | `POST /tools/url-to-markdown` | 提取 Markdown |
+
+### `url_to_pdf` 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `url` | string（必填） | 待转换页面的公网 http(s) URL |
+| `format` | `A4` / `Letter` / `Legal` | 纸张大小，默认 `A4` |
+| `landscape` | boolean | 横向，默认 `false` |
+| `printBackground` | boolean | 打印背景图形，默认 `true` |
+| `scale` | number | 缩放 0.1–2，默认 `1` |
+| `margin` | string / object | 边距，如 `"10mm"` 或 `{top,right,bottom,left}` |
+| `preferCssPageSize` | boolean | 遵循页面 CSS `@page` 尺寸 |
+
+### `url_to_screenshot` 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `url` | string（必填） | 目标 URL |
+| `fullPage` | boolean | 截取整页，默认 `true` |
+| `format` | `png` / `jpeg` | 默认 `png` |
+| `quality` | number | JPEG 质量 0–1，默认 `0.8` |
+
+### `url_to_markdown` 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `url` | string（必填） | 目标 URL |
+| `removeSelectors` | string[] | 提取前剔除的 CSS 选择器，如 `["nav",".ads","footer"]` |
+| `keepImages` | boolean | 保留图片链接，默认 `false` |
+
+---
+
+## 自行部署（开发者）
+
+### 前置要求
+
+- Cloudflare Workers 账号（Browser Rendering 需 Paid 计划）
+- Node 20+
+- Paddle 账号（用于收款与授权发放）
+
+### 步骤
+
+1. 克隆并安装依赖：
+
+   ```bash
+   git clone https://github.com/strayly/url-to-pdf.git
+   cd url-to-pdf
+   npm install
+   ```
+
+2. 创建两个 KV 命名空间（分别用于存放 API key 与渲染产物），把它们的 ID 填入 `wrangler.jsonc` 的 `kv_namespaces`。
+
+3. 在 `wrangler.jsonc` 的 `vars` 中填入：
+
+   | 变量 | 说明 |
+   |---|---|
+   | `WORKER_ORIGIN` | 你的 Worker 域名 |
+   | `PADDLE_ENV` | `sandbox`（测试）或 `live`（生产） |
+   | `PADDLE_PRICE_ID` | Paddle 后台的 Price ID（`pri_...`） |
+   | `PADDLE_CLIENT_TOKEN` | Paddle Client-side token（`test_...` / `live_...`） |
+
+4. 用 `wrangler secret put` 设置密钥（**不要写进仓库**，已被 `.gitignore` 忽略）：
+
+   ```bash
+   npx wrangler secret put PADDLE_API_KEY         # Paddle 服务端 API key
+   npx wrangler secret put PADDLE_WEBHOOK_SECRET  # 通知目的地 Signing secret
+   ```
+
+5. 部署：
+
+   ```bash
+   npx wrangler deploy
+   ```
+
+### Paddle 后台配置
+
+在 Paddle 后台完成以下配置：
+
+- **Product**：新建产品，Tax category 选 `Standard digital goods`。
+- **Price**：在产品下新建价格，Pricing model 选 `Recurring`（订阅制），记录 Price ID。
+- **API key**：Authentication 页创建 server-side API key。
+- **Notifications**：在 `Events → Notifications` 新建通知目的地，URL 填 `https://<你的域名>/webhook/paddle`，勾选 `transaction.completed` 及订阅相关事件，复制 Signing secret。
+- **Client-side token**：Authentication 页创建，用于结账页初始化。
+- **Default payment link**：在 `Checkout → Checkout settings` 设置一个默认链接（sandbox 可用 `http://localhost`，生产需换成已通过审核的域名）。
+
+> sandbox 与 live 是两个完全隔离的环境，以上各项需分别在两边配置，密钥不可混用。
+
+### 本地开发
+
+```bash
+cp .dev.vars.example .dev.vars   # 填入本地测试用的 secret
+npx wrangler dev
+node scripts/selfcheck.mjs http://127.0.0.1:8787   # 鉴权与 SSRF 自检
+node scripts/live-test.mjs                        # 全链路自测（webhook 自签）
 ```
-[ ] GitHub 上建 repo 并 push 代码（包名改成你自己的）
-[ ] npx mcp-publisher publish                  → 官方 Registry（DR 90，数据源）
-[ ] npx smithery mcp publish                   → Smithery（~44 万月访）
-[ ] mcp.so 提交表单                             → mcp.so（~24 万月访；免费路径进搜索较慢，$39 premium 即时）
-[ ] mcpservers.org 提交表单                     → mcpservers.org（~50 万月访）
-[ ] GitHub repo 加 mcp-server topic             → Glama 自动抓取
-```
 
-README 里务必写清楚「它能干什么」，不是「它怎么实现的」——目录流量是需求驱动的，开发者在搜能力。
+---
+
+## 架构简述
+
+- `/mcp`：MCP 发现层（免费）。列出工具与购买信息；携带有效 key 时也可直接渲染。
+- `/tools/*`：受 `x-api-key` 保护的渲染端点。
+- `/buy` + `/checkout`：Paddle 结账流程，建交易并展示本站收银台浮层。
+- `/webhook/paddle`：接收 Paddle 付款事件，HMAC 验签后自动签发 API key。
+- `/portal/claim`：用户凭结账邮箱领取 API key。
+- 渲染产物暂存于 KV（1 小时 TTL），以下载链接返回。
+
+---
+
+## 安全说明
+
+- 仅允许公网 http(s) 地址，静态拦截内网 / 保留网段（如 `127.0.0.0/8`、`10.0.0.0/8`、`169.254.0.0/16` 等）。
+- 部署于高安全等级环境时，建议额外补充 DNS 解析校验以防御 DNS rebinding。
+- 所有凭据通过 `wrangler secret put` 注入，不进入代码仓库。
 
 ---
 
 ## 成本
 
-| 项 | 说明 |
-|---|---|
-| Workers Paid | $5/月，Browser Rendering 的前置条件 |
-| Browser Rendering | 有免费额度，超出按会话计费 —— **去控制台核对当前配额** |
-| KV | 免费额度足够撑到有真实量为止（产物 1 小时 TTL，自动过期） |
+- Cloudflare Workers Paid 计划（Browser Rendering 的前置条件）
+- Browser Rendering 按会话计费，含免费额度
+- KV 含免费额度，产物自动过期
 
 ---
 
-## 已知短板（诚实交代）
+## 许可证
 
-1. **DNS rebinding**：`src/guard.ts` 只做字符串层面的内网 IP 拦截，没做 DNS 解析校验。堵死需每请求多一次 DNS。
-2. **KV 25MB 上限**：超了返回 413，上量换 R2。
-3. **Paddle 变更隔离**：所有收款/验签逻辑在 `src/pay.ts` 一个文件，换收款方式只动它。
-4. **webhook 验签密钥**：`PADDLE_WEBHOOK_SECRET` 是 Paddle 通知目的地的 Signing secret，生产务必填你自己的（sandbox 与 live 各一套，不能混用）。
-
----
-
-## 关于这条路的预期
-
-单点不赚钱，矩阵才赚钱。一个估算模型：免费 server 月 500 次安装 → 2% 点到付费页 → 约 10 访问 → 5% 转化 → 月约 0.5 单。
-
-**这个 server 的真正价值是跑通「目录流量 → Paddle 收款 → 自动发卡 → 用户调用」的完整闭环。** 链路一旦跑通，复制第二个 server 的代码成本几乎为零。
+MIT
