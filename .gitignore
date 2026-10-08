@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-dryrun/
+.wrangler/
+.dev.vars
+tmp-err.txt
+*.log
+.DS_Store

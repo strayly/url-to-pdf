@@ -1,0 +1,27 @@
+{
+  "name": "url-to-pdf-mcp",
+  "version": "0.2.0",
+  "description": "Turn any web page into PDF, screenshot or Markdown. Requires an API key purchased via Paddle.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["mcp", "mcp-server", "paddle", "pdf", "screenshot", "markdown", "browser-rendering", "cloudflare-workers"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "wrangler dev --remote",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "selfcheck": "node scripts/selfcheck.mjs",
+    "livetest": "node scripts/live-test.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "hono": "^4.13.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260914.1",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.131.2"
+  }
+}

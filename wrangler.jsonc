@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "url-to-pdf-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "browser": { "binding": "BROWSER" },
+
+  "kv_namespaces": [
+    { "binding": "KEYS", "id": "112dbd7e8b994ce6afeab0431f96bb57" },
+    { "binding": "ASSETS", "id": "dc39c0196daa4746b075d93797969b24" }
+  ],
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    "WORKER_ORIGIN": "https://your-worker-subdomain.workers.dev",
+    "PADDLE_ENV": "sandbox",
+    "PADDLE_PRICE_ID": "REPLACE_WITH_YOUR_PADDLE_PRICE_ID",
+    "PADDLE_CLIENT_TOKEN": "REPLACE_WITH_YOUR_PADDLE_CLIENT_TOKEN",
+    "PRICE_PDF": "Plan $5/mo",
+    "PRICE_SCREENSHOT": "Plan $5/mo",
+    "PRICE_MARKDOWN": "Plan $5/mo"
+  }
+}
