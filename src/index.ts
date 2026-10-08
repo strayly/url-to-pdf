@@ -11,6 +11,7 @@ import {
 } from './pay'
 import { handleMcp } from './mcp'
 import { GuardError, assertPublicUrl } from './guard'
+import { landingPage, privacyPage, refundPage, termsPage } from './pages'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -151,62 +152,12 @@ app.get('/openapi.json', (c) => {
   })
 })
 
-// ---------------------------------------------------------------- 首页
+// ---------------------------------------------------------------- 首页 + 法律页
 
-app.get('/', (c) => {
-  const eps = listPaidEndpoints(c.env)
-  return c.html(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>url-to-pdf — API key via Paddle</title>
-<style>
- body{font:15px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:680px;margin:8vh auto;padding:0 20px;color:#1a1a1a}
- h1{font-size:22px;font-weight:600;margin:0 0 4px}
- p.sub{color:#666;margin:0 0 28px}
- code{background:#f4f4f5;padding:2px 5px;border-radius:3px;font-size:13px}
- pre{background:#f4f4f5;padding:14px;border-radius:6px;overflow-x:auto;font-size:13px}
- table{border-collapse:collapse;width:100%;margin:20px 0}
- th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #e5e5e5;font-size:14px}
- th{color:#666;font-weight:500}
- .price{color:#0a6;font-weight:500}
- .cta{display:inline-block;background:#0a6;color:#fff;padding:9px 16px;border-radius:6px;text-decoration:none;font-weight:500}
-</style></head>
-<body>
-<h1>url-to-pdf</h1>
-<p class="sub">Render any public web page to PDF, screenshot or Markdown. Pay once, get an API key via Paddle.</p>
-
-<table>
-<tr><th>Endpoint</th><th>Plan</th></tr>
-${eps
-  .map(
-    (e) =>
-      `<tr><td><code>POST ${new URL(e.url).pathname}</code></td><td class="price">${e.price}</td></tr>`,
-  )
-  .join('')}
-</table>
-
-<h3>Get an API key</h3>
-<p><a class="cta" href="/buy">Buy an API key (Paddle checkout)</a></p>
-<p>After checkout, retrieve your key at <code>/portal/claim?email=you@example.com</code>.</p>
-
-<h3>Call it</h3>
-<pre>curl -X POST ${originOf(c)}/tools/url-to-pdf \\
-  -H "Content-Type: application/json" \\
-  -H "x-api-key: YOUR_KEY" \\
-  -d '{"url":"https://example.com","format":"A4"}'</pre>
-
-<h3>Connect as MCP</h3>
-<pre>{
-  "mcpServers": {
-    "url-to-pdf": {
-      "command": "npx",
-      "args": ["mcp-remote", "${originOf(c)}/mcp", "--header", "x-api-key: YOUR_KEY"]
-    }
-  }
-}</pre>
-<p>Paid tools return their own guidance on call — buy a key, then hit the HTTP endpoints with it.</p>
-</body></html>`)
-})
+app.get('/', (c) => c.html(landingPage(originOf(c))))
+app.get('/privacy', (c) => c.html(privacyPage()))
+app.get('/refund', (c) => c.html(refundPage()))
+app.get('/terms', (c) => c.html(termsPage()))
 
 function originOf(c: any): string {
   const configured = c.env?.WORKER_ORIGIN?.replace(/\/$/, '')
