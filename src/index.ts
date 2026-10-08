@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from './env'
-import { renderAndStore, type Kind } from './render'
+import { renderAndStore, BusyError, type Kind } from './render'
 import {
   requireApiKey,
   listPaidEndpoints,
@@ -60,6 +60,17 @@ async function handleRender(c: any, kind: Kind) {
     if (err instanceof GuardError) {
       return c.json({ error: 'bad_request', detail: err.message }, 400)
     }
+    if (err instanceof BusyError) {
+      return c.json(
+        {
+          error: 'busy',
+          detail: 'Rendering capacity is momentarily saturated. Retry in a few seconds.',
+          retryAfterSeconds: err.retryAfterSeconds,
+        },
+        429,
+        { 'Retry-After': String(err.retryAfterSeconds) },
+      )
+    }
     return c.json(
       { error: 'render_failed', detail: err instanceof Error ? err.message : String(err) },
       502,
@@ -69,8 +80,10 @@ async function handleRender(c: any, kind: Kind) {
 
 // ---------------------------------------------------------------- 产物下载
 
-app.get('/f/:key', async (c) => {
-  const key = c.req.param('key')
+// 注意：产物 key 形如 "pdf/<uuid>.pdf"，**含斜杠**，所以必须用通配路由 /f/*，
+// 单段 :key 参数匹配不到两段路径（会导致所有下载链接 404）。
+app.get('/f/*', async (c) => {
+  const key = decodeURIComponent(new URL(c.req.url).pathname.slice('/f/'.length))
   if (!key || key.includes('..')) return c.json({ error: 'not_found' }, 404)
 
   const obj = await c.env.ASSETS.getWithMetadata(key, 'arrayBuffer')

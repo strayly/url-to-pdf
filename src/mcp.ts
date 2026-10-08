@@ -1,6 +1,6 @@
 import type { Env } from './env'
 import { listPaidEndpoints, extractApiKey, validateApiKey, paywallDisabled } from './pay'
-import { renderAndStore, type Kind } from './render'
+import { renderAndStore, BusyError, type Kind } from './render'
 
 /**
  * MCP 层只做「发现」，HTTP 层负责「成交」。
@@ -249,6 +249,26 @@ async function callTool(
       ],
     })
   } catch (err) {
+    if (err instanceof BusyError) {
+      return rpcOk(id, {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                error: 'busy',
+                detail: 'Rendering capacity is momentarily saturated.',
+                retryAfterSeconds: err.retryAfterSeconds,
+                hint: 'Wait a few seconds and call this tool again.',
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      })
+    }
     const detail = err instanceof Error ? err.message : String(err)
     return rpcOk(id, {
       isError: true,

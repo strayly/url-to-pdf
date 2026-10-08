@@ -34,6 +34,41 @@ const FILE_TTL_SECONDS = 3600
 
 const MAX_HTML_BYTES = 5 * 1024 * 1024
 
+/**
+ * 启动浏览器，对「并发被限流」做有限重试。
+ * Browser Rendering 在高并发/免费额度下会抛
+ * `Unable to create new browser: code: 429: message: Rate limit exceeded`，
+ * 这是瞬时的，等一两秒再试通常就能拿到实例 —— 付费调用不该因这个直接失败。
+ */
+const LAUNCH_ATTEMPTS = 3
+const LAUNCH_BACKOFF_MS = 1500
+const RETRYABLE_RE = /rate limit|429|too many|busy|try again/i
+
+/** 渲染容量暂时耗尽（并发/新建实例被限流）。调用方应回 429 让客户稍后重试。 */
+export class BusyError extends Error {
+  readonly retryAfterSeconds: number
+  constructor(message: string, retryAfterSeconds = 20) {
+    super(message)
+    this.name = 'BusyError'
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}
+
+async function launchBrowser(env: BrowserEnv) {
+  for (let attempt = 1; attempt <= LAUNCH_ATTEMPTS; attempt++) {
+    try {
+      return await puppeteer.launch(env.BROWSER)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!RETRYABLE_RE.test(msg)) throw err
+      if (attempt === LAUNCH_ATTEMPTS) throw new BusyError(msg)
+      await new Promise<void>((r) => setTimeout(r, LAUNCH_BACKOFF_MS * attempt))
+    }
+  }
+  // 循环要么 return 要么 throw，这里只是让类型收敛
+  throw new BusyError('browser unavailable')
+}
+
 async function withPage<T>(
   env: BrowserEnv,
   rawUrl: string,
@@ -42,7 +77,7 @@ async function withPage<T>(
 ): Promise<T> {
   const target = assertPublicUrl(rawUrl)
 
-  const browser = await puppeteer.launch(env.BROWSER)
+  const browser = await launchBrowser(env)
   try {
     const page = await browser.newPage()
     await page.setViewport({ width: 1280, height: 900 })
