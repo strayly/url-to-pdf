@@ -32,6 +32,8 @@ export interface Env {
   PRICE_PDF: string
   PRICE_SCREENSHOT: string
   PRICE_MARKDOWN: string
+  /** url-to-extract 的价格文案；不配则回落成 PRICE_MARKDOWN */
+  PRICE_EXTRACT?: string
 
   /** 管理员发卡令牌：设置后 /admin/issue 可直发卡，用于沙箱自测；生产删除 */
   ADMIN_TOKEN?: string

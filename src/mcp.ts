@@ -33,6 +33,28 @@ const NAV_PROPS = {
   },
   waitForSelector: str('Optional CSS selector to wait for before rendering.'),
   waitMs: num('Extra settle time after load, 0-10000ms. Few dynamics pages need this.'),
+  timeoutMs: num('Navigation timeout in ms, 5000-100000. Default 45000.'),
+  // 以下四项用于「干净渲染」+ 渲染前交互
+  blockAds: bool('Block requests to major ad/analytics domains before rendering. Default false.'),
+  hideCookieBanners: bool('Remove elements that look like cookie consent banners. Default false.'),
+  darkMode: bool('Render with prefers-color-scheme: dark. Default false.'),
+  clickSelector: str('CSS selector to click before rendering (expand, dismiss modal, switch tab).'),
+}
+
+/** 视口参数：320-3840 × 240-2160，设备像素比 0.5-3 */
+const VIEWPORT_PROPS = {
+  width: num('Viewport width in px, 320-3840. Default 1280.'),
+  height: num('Viewport height in px, 240-2160. Default 900.'),
+  deviceScaleFactor: num('Device pixel ratio, 0.5-3. Default 1. Set 2 for retina.'),
+}
+
+/** 工具注解：客户端据此判断能不能自动执行；目录审核也看这个。 */
+const READ_ONLY_ANNOTATIONS = {
+  title: '',
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
 }
 
 function srvOrigin(env: Env): string {
@@ -77,6 +99,7 @@ function buildTools(env: Env): ToolDef[] {
           scale: num('Scale, 0.1-2. Default 1.'),
           margin: str('Margin shorthand like "10mm" — or an object {top,right,bottom,left}. Optional.'),
           preferCssPageSize: bool('Honor the page CSS @page size instead of the format option.'),
+          ...VIEWPORT_PROPS,
           ...NAV_PROPS,
         },
         required: ['url'],
@@ -96,6 +119,9 @@ function buildTools(env: Env): ToolDef[] {
           fullPage: bool('Capture the full scrollable page, not just the viewport. Default true.'),
           format: { type: 'string', enum: ['png', 'jpeg'], description: 'Image format. Default png.' },
           quality: num('JPEG quality 0-1. Ignored for png. Default 0.8.'),
+          selector: str('Capture only the element matching this CSS selector, instead of the page.'),
+          clip: str('Clip region as "x,y,width,height" — or an object {x,y,width,height}. Optional.'),
+          ...VIEWPORT_PROPS,
           ...NAV_PROPS,
         },
         required: ['url'],
@@ -118,6 +144,25 @@ function buildTools(env: Env): ToolDef[] {
             description: 'CSS selectors to strip before extraction, e.g. ["nav", ".ads", "footer"].',
           },
           keepImages: bool('Keep image links in the Markdown output. Default false.'),
+          ...VIEWPORT_PROPS,
+          ...NAV_PROPS,
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'url_to_extract',
+      kind: 'paid',
+      renderKind: 'extract',
+      endpoint: eps['POST /tools/url-to-extract']?.url,
+      description: `Extract structured data from a page as JSON: title, meta description, canonical URL, language, main text and links. Readability-first, no LLM involved. Requires an API key purchased at ${origin}/buy. Same auth as the other paid tools.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: str('Absolute http(s) URL of the page to extract. Required.'),
+          maxTextChars: num('Truncate main text to this many characters, 500-200000. Default 20000.'),
+          maxLinks: num('Maximum number of links to return, 0-500. Default 100.'),
           ...NAV_PROPS,
         },
         required: ['url'],
@@ -336,6 +381,7 @@ async function dispatch(msg: any, request: Request, env: Env): Promise<RpcReturn
           name: t.name,
           description: t.description,
           inputSchema: t.inputSchema,
+          annotations: { ...READ_ONLY_ANNOTATIONS, title: t.name },
         })),
       })
     case 'tools/call': {
@@ -370,6 +416,42 @@ async function dispatch(msg: any, request: Request, env: Env): Promise<RpcReturn
 }
 
 // ---------------------------------------------------------------- 工具执行
+
+/**
+ * 组装 tools/call 的 content。
+ * 第 1 块永远是文本（下载信息 + receipt），第 2 块是内联产物：
+ *   图片 → image content（客户端直接渲染）
+ *   其余 → embedded resource（PDF / Markdown / JSON）
+ * 内联的 base64 不重复塞进文本块，否则一条消息几 MB、把客户端卡死。
+ */
+function buildCallContent(out: {
+  downloadUrl: string
+  contentType: string
+  sizeBytes: number
+  title: string
+  ttlSeconds: number
+  meta: Record<string, unknown>
+  receipt: Record<string, unknown>
+  inline?: { base64: string; mimeType: string }
+}): Json[] {
+  const { inline, ...textPart } = out
+  const content: Json[] = [{ type: 'text', text: JSON.stringify(textPart, null, 2) }]
+
+  if (!inline) return content
+  if (/^image\//.test(inline.mimeType)) {
+    content.push({ type: 'image', data: inline.base64, mimeType: inline.mimeType })
+  } else {
+    content.push({
+      type: 'resource',
+      resource: {
+        uri: out.downloadUrl,
+        mimeType: inline.mimeType,
+        blob: inline.base64,
+      },
+    })
+  }
+  return content
+}
 
 async function callTool(
   id: unknown,
@@ -439,14 +521,7 @@ async function callTool(
 
   try {
     const out = await renderAndStore(env, tool.renderKind, args as Record<string, any>, origin)
-    return makeResponse(id, {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(out, null, 2),
-        },
-      ],
-    })
+    return makeResponse(id, { content: buildCallContent(out) })
   } catch (err) {
     if (err instanceof BusyError) {
       return makeResponse(id, {

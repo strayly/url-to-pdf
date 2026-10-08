@@ -21,6 +21,9 @@
     "PADDLE_CLIENT_TOKEN": "REPLACE_WITH_YOUR_PADDLE_CLIENT_TOKEN",
     "PRICE_PDF": "Plan $5/mo",
     "PRICE_SCREENSHOT": "Plan $5/mo",
-    "PRICE_MARKDOWN": "Plan $5/mo"
+    "PRICE_MARKDOWN": "Plan $5/mo",
+    "PRICE_EXTRACT": "Plan $5/mo",
+    "DAILY_LIMIT": "50",
+    "PER_MIN_LIMIT": "10"
   }
 }

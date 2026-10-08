@@ -59,6 +59,7 @@ app.use('/tools/*', requireApiKey())
 app.post('/tools/url-to-pdf', (c) => handleRender(c, 'pdf'))
 app.post('/tools/url-to-screenshot', (c) => handleRender(c, 'screenshot'))
 app.post('/tools/url-to-markdown', (c) => handleRender(c, 'markdown'))
+app.post('/tools/url-to-extract', (c) => handleRender(c, 'extract'))
 
 async function handleRender(c: any, kind: Kind) {
   let args: Record<string, unknown>

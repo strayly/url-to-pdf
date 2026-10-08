@@ -39,6 +39,13 @@ export function listPaidEndpoints(env: Env): EndpointPrice[] {
       description: 'Extract the main content of a page as clean Markdown.',
       url: `${origin}/tools/url-to-markdown`,
     },
+    {
+      route: 'POST /tools/url-to-extract',
+      price: env.PRICE_EXTRACT ?? env.PRICE_MARKDOWN,
+      description:
+        'Extract structured data (title, meta, canonical, language, main text, links) as JSON.',
+      url: `${origin}/tools/url-to-extract`,
+    },
   ]
 }
 
