@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.strayly/url-to-pdf",
+  "title": "url-to-pdf",
+  "description": "Turn public web pages into PDF, PNG screenshots, or clean Markdown with one API key.",
+  "version": "0.2.0",
+  "websiteUrl": "https://url-pdf.hammbox.com",
+  "repository": {
+    "url": "https://github.com/strayly/url-to-pdf",
+    "source": "github",
+    "id": "1409840345"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://url-pdf.hammbox.com/mcp",
+      "headers": [
+        {
+          "name": "x-api-key",
+          "description": "API key purchased at https://url-pdf.hammbox.com/buy (Paddle checkout).",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
