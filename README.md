@@ -1,83 +1,90 @@
-# url-to-pdf-mcp
+# url-to-pdf
 
-把任意**公开网页**转换为 **PDF / 整页截图 / Markdown** 的 MCP server 与 HTTP API。
-通过 Paddle 购买 API key 后调用，无需自建浏览器渲染环境。
+**Turn any public web page into a PDF, a full-page screenshot, or clean Markdown — with one API key.**
 
-- 标准 MCP server，兼容 Claude Desktop、Cursor 等支持 tool-calling 的客户端
-- 原生 HTTP API，便于脚本、服务端、低代码平台直接调用
-- SSRF 防护：仅允许公网 http(s) 地址，拦截内网/保留网段
-- 基于 Paddle 的订阅制授权，付款后自动发卡
+No browser farm to run, no headless Chrome to babysit. `url-to-pdf` renders pages on Cloudflare's infrastructure and hands you a download link. Use it from any MCP-compatible AI client (Claude Desktop, Cursor, and friends) by just talking, or call the HTTP API directly from your scripts.
+
+![url-to-pdf preview](docs/preview.svg)
 
 ---
 
-## 线上实例
+## Why you'll like it
 
-已部署公开实例，可直接使用，无需自建：
-
-```
-https://url-pdf.hammbox.com
-```
-
----
-
-## 获取 API key
-
-1. 打开 `https://url-pdf.hammbox.com/buy` 进入结账页。
-2. 完成订阅付款（Paddle 结账，支持主流信用卡）。
-3. 付款完成后，打开
-   `https://url-pdf.hammbox.com/portal/claim?email=<你付款用的邮箱>`
-   即可领取你的 API key（`utp_...`）。
+- **Three outputs, one key.** PDF (A4 / Letter, portrait or landscape), full-page PNG/JPEG screenshots, and clean Markdown (navigation and ads stripped out).
+- **Just talk to it.** Connect it as an MCP server and say *"turn https://example.com into a PDF"* — your client does the rest. No curl, no JSON to hand-write.
+- **Also a plain HTTP API.** Every tool is a single `POST` with your `x-api-key`. Great for scripts, backends, and low-code platforms.
+- **SSRF-protected.** Only public `http(s)` URLs are accepted; internal and reserved addresses are rejected at the edge.
+- **Private by design.** Outputs are kept for **1 hour** then auto-deleted. We never see your card (Paddle handles payments) and your email is used only to recover your key.
 
 ---
 
-## 使用方式
+## Get your API key
 
-### 方式一：作为 MCP server（推荐给 AI 客户端）
+1. Go to **[url-pdf.hammbox.com/buy](https://url-pdf.hammbox.com/buy)** and complete checkout (Paddle — major credit cards).
+2. **Your key appears on screen the moment payment completes.** Copy it and keep it safe.
+3. Lost it? Recover it anytime at **[/portal/claim](https://url-pdf.hammbox.com/portal/claim)** with the email you used at checkout. No password, no support ticket.
 
-在 Claude Desktop / Cursor 等客户端的 MCP 配置中加入：
+---
+
+## Use it as an MCP server (recommended for AI clients)
+
+Add `url-to-pdf` to your client's MCP configuration. With Claude Desktop, Cursor, or any client that supports **Streamable HTTP**:
 
 ```json
 {
   "mcpServers": {
     "url-to-pdf": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://url-pdf.hammbox.com/mcp",
-        "--header", "x-api-key: YOUR_API_KEY"
-      ]
+      "type": "http",
+      "url": "https://url-pdf.hammbox.com/mcp",
+      "headers": { "x-api-key": "YOUR_API_KEY" }
     }
   }
 }
 ```
 
-连接后可直接用自然语言调用，例如「把 https://example.com 转成 PDF」。
+That's it — no local install. Then just ask your assistant in natural language:
 
-### 方式二：作为 HTTP API（推荐给脚本 / 服务端）
+> *"Convert https://news.ycombinator.com to a PDF and give me the download link."*
 
-所有渲染走 `POST /tools/*`，请求头带 `x-api-key`：
+The client calls the tool, passes your key, and shows you the result.
+
+---
+
+## Use it as an HTTP API (for scripts & backends)
+
+Every render is a `POST` to a `/tools/*` endpoint with your key in the header.
 
 ```bash
-# 网页转 PDF
+# Web page → PDF
 curl -X POST https://url-pdf.hammbox.com/tools/url-to-pdf \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -d '{"url":"https://example.com","format":"A4"}'
 
-# 整页截图
+# Full-page screenshot
 curl -X POST https://url-pdf.hammbox.com/tools/url-to-screenshot \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -d '{"url":"https://example.com","fullPage":true,"format":"png"}'
 
-# 提取 Markdown
+# Extract Markdown
 curl -X POST https://url-pdf.hammbox.com/tools/url-to-markdown \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -d '{"url":"https://example.com"}'
 ```
 
-返回 JSON 含 `downloadUrl`（有效期 1 小时），再下载即可：
+The response includes a `downloadUrl` valid for **1 hour**:
+
+```json
+{
+  "downloadUrl": "https://url-pdf.hammbox.com/f/pdf/<id>.pdf",
+  "contentType": "application/pdf",
+  "sizeBytes": 456494,
+  "title": "Example Domain",
+  "ttlSeconds": 3600
+}
+```
 
 ```bash
 curl -O "<downloadUrl>"
@@ -85,48 +92,37 @@ curl -O "<downloadUrl>"
 
 ---
 
-## API 参考
+## Tools & parameters
 
-### 工具 / 端点对照
-
-| MCP 工具名 | HTTP 端点 | 说明 |
+| MCP tool | HTTP endpoint | What it does |
 |---|---|---|
-| `list_capabilities` | `GET /openapi.json` | 免费。列出能力、价格与购买入口 |
-| `url_to_pdf` | `POST /tools/url-to-pdf` | 网页转 PDF |
-| `url_to_screenshot` | `POST /tools/url-to-screenshot` | 整页截图 |
-| `url_to_markdown` | `POST /tools/url-to-markdown` | 提取 Markdown |
+| `list_capabilities` *(free)* | `GET /openapi.json` | Lists capabilities, prices, and where to buy a key |
+| `url_to_pdf` | `POST /tools/url-to-pdf` | Render a page to PDF |
+| `url_to_screenshot` | `POST /tools/url-to-screenshot` | Capture a full-page screenshot |
+| `url_to_markdown` | `POST /tools/url-to-markdown` | Extract the page as clean Markdown |
 
-### `url_to_pdf` 参数
+**`url_to_pdf`** — `url` *(required)*, `format` (`A4` / `Letter` / `Legal`, default `A4`), `landscape`, `printBackground`, `scale` (0.1–2), `margin`, `preferCssPageSize`.
 
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `url` | string（必填） | 待转换页面的公网 http(s) URL |
-| `format` | `A4` / `Letter` / `Legal` | 纸张大小，默认 `A4` |
-| `landscape` | boolean | 横向，默认 `false` |
-| `printBackground` | boolean | 打印背景图形，默认 `true` |
-| `scale` | number | 缩放 0.1–2，默认 `1` |
-| `margin` | string / object | 边距，如 `"10mm"` 或 `{top,right,bottom,left}` |
-| `preferCssPageSize` | boolean | 遵循页面 CSS `@page` 尺寸 |
+**`url_to_screenshot`** — `url` *(required)*, `fullPage` (default `true`), `format` (`png` / `jpeg`), `quality` (0–1).
 
-### `url_to_screenshot` 参数
+**`url_to_markdown`** — `url` *(required)*, `removeSelectors` (e.g. `["nav",".ads","footer"]`), `keepImages`.
 
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `url` | string（必填） | 目标 URL |
-| `fullPage` | boolean | 截取整页，默认 `true` |
-| `format` | `png` / `jpeg` | 默认 `png` |
-| `quality` | number | JPEG 质量 0–1，默认 `0.8` |
+---
 
-### `url_to_markdown` 参数
+## Pricing
 
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `url` | string（必填） | 目标 URL |
-| `removeSelectors` | string[] | 提取前剔除的 CSS 选择器，如 `["nav",".ads","footer"]` |
-| `keepImages` | boolean | 保留图片链接，默认 `false` |
+**$5 / month** — one subscription, one API key, all three tools included. Billed and managed by **Paddle** (our Merchant of Record); cancel anytime from your Paddle customer portal.
 
+> Fair-use note: rendering runs on Cloudflare Browser Rendering. Under the free tier, a short burst of heavy concurrent load may be briefly rate-limited (HTTP 429) — just retry in a few seconds.
 
+---
 
-## 许可证
+## Links
+
+- Live demo: **[url-pdf.hammbox.com](https://url-pdf.hammbox.com)**
+- Privacy Policy · Refund Policy · Terms of Service (linked from the site footer)
+- Contact: feedback@hammbox.com
+
+## License
 
 MIT

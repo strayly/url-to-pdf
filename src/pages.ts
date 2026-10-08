@@ -53,8 +53,9 @@ export function landingPage(origin: string): string {
   const mcp = `{
   "mcpServers": {
     "url-to-pdf": {
-      "command": "npx",
-      "args": ["mcp-remote", "${origin}/mcp", "--header", "x-api-key: YOUR_KEY"]
+      "type": "http",
+      "url": "${origin}/mcp",
+      "headers": { "x-api-key": "YOUR_KEY" }
     }
   }
 }`
@@ -73,9 +74,9 @@ export function landingPage(origin: string): string {
 <p><a class="cta" href="/buy">Buy an API key</a></p>
 
 <h2>Get started</h2>
-<p>After checkout, claim your key at <code>/portal/claim?email=you@example.com</code>, then call the API:</p>
+<p>Your API key appears on screen the moment checkout completes — no extra steps. If you ever lose it, recover it anytime at <code>/portal/claim?email=you@example.com</code>. Then call the API:</p>
 <pre>${curl}</pre>
-<p>Or connect it as an MCP server (works with Claude Desktop, Cursor, and any mcp-remote client):</p>
+<p>Or connect it as an MCP server (works with Claude Desktop, Cursor, and any MCP client that supports Streamable HTTP):</p>
 <pre>${mcp}</pre>
 <p class="muted">Fair-use note: rendering runs on Cloudflare Browser Rendering. Under the free tier, short bursts of heavy concurrent load may be briefly rate-limited (HTTP 429) — just retry in a few seconds.</p>`,
   )

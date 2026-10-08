@@ -17,6 +17,20 @@ const app = new Hono<{ Bindings: Env }>()
 
 const FILE_TTL_MS = 60 * 60 * 1000
 
+// ---------------------------------------------------------------- 全局 CORS 后处理
+// 让 MCP 客户端（桌面/网页）跨域调用 /mcp 与 /tools 不被浏览器拦。
+// 用「后处理」写法：next() 之后修改 c.res，才能覆盖 handler 自己返回的 Response。
+app.use('*', async (c, next) => {
+  await next()
+  const h = c.res.headers
+  h.set('Access-Control-Allow-Origin', '*')
+  h.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+  h.set(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, x-api-key, Mcp-Session-Id, mcp-protocol-version',
+  )
+})
+
 // ---------------------------------------------------------------- 免费前置校验
 // 内网/非法 URL 在鉴权之前就挡掉，避免被人用你的 Worker 扫内网/云 metadata。
 app.use('/tools/*', async (c, next) => {
@@ -116,7 +130,9 @@ app.get('/portal/claim', (c) => handleClaim(c.req.raw, c.env))
 
 // ---------------------------------------------------------------- MCP
 // 发现层不鉴权（任何人都能看工具清单和价格）；执行层（/tools/*）才要 key。
-app.post('/mcp', (c) => handleMcp(c.req.raw, c.env))
+// Streamable HTTP：POST 收发 JSON-RPC、GET 开 SSE 流、DELETE 结束会话，全部走这一个入口。
+app.all('/mcp', (c) => handleMcp(c.req.raw, c.env))
+app.options('/mcp', (c) => new Response(null, { status: 204 }))
 
 app.get('/openapi.json', (c) => {
   const eps = listPaidEndpoints(c.env)

@@ -243,24 +243,108 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
   return new Response('ok', { status: 200 })
 }
 
-/** 支付完成后，用户凭邮箱自助领取 key */
+/** 支付完成后，用户凭邮箱自助领取 key。邮箱即账号，可无限次重领（幂等）。 */
 export async function handleClaim(request: Request, env: Env): Promise<Response> {
   const u = new URL(request.url)
   const email = (u.searchParams.get('email') || '').trim()
+  const accept = request.headers.get('accept') || ''
+  const wantsJson =
+    accept.toLowerCase().includes('application/json') ||
+    request.headers.get('x-requested-with') === 'fetch'
+
   if (!email) {
-    return json({ error: 'email_required', message: 'Pass ?email=you@example.com used at checkout.' }, 400)
+    if (wantsJson) {
+      return json({ error: 'email_required', message: 'Pass ?email=you@example.com used at checkout.' }, 400)
+    }
+    return new Response(claimFormHtml(), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
   }
+
   const key = await env.KEYS.get(`cust:${email.toLowerCase()}`)
   if (!key) {
-    return json(
-      { error: 'no_key', message: 'No active key for this email. Complete a purchase first.' },
-      404,
-    )
+    if (wantsJson) {
+      return json(
+        { error: 'no_key', message: 'No active key for this email. Complete a purchase first.' },
+        404,
+      )
+    }
+    return new Response(claimNotFoundHtml(email), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
   }
-  return json({
-    apiKey: key,
-    note: 'Use it as "Authorization: Bearer <key>" or "x-api-key: <key>" on /tools/* and /mcp.',
+
+  if (wantsJson) {
+    return json({
+      apiKey: key,
+      note: 'Use it as "Authorization: Bearer <key>" or "x-api-key: <key>" on /tools/* and /mcp.',
+    })
+  }
+  return new Response(claimKeyHtml(email, key), {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
   })
+}
+
+function claimShell(title: string, body: string): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+ body{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1a1a1a;background:#fafafa;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{background:#fff;border:1px solid #ebebeb;border-radius:12px;padding:32px 28px;max-width:440px;width:calc(100% - 40px);text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+ h1{font-size:18px;margin:0 0 10px;font-weight:600}
+ p{color:#666;margin:0 0 16px;font-size:14px}
+ .ok{color:#0a6}
+ input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ccc;border-radius:6px;font-size:14px;margin-bottom:10px}
+ button{background:#0a6;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer}
+ .keybox{display:flex;gap:8px;align-items:center;justify-content:center;margin:8px 0 14px}
+ .keybox code{background:#f4f4f5;padding:8px 10px;border-radius:6px;font-size:13px;word-break:break-all;text-align:left}
+ .keybox button{background:#0a6;padding:8px 14px}
+ .muted{color:#888;font-size:13px}
+ a.link{color:#0a6}
+ a.back{display:block;margin-top:16px;color:#888;font-size:13px;text-decoration:none}
+</style></head>
+<body><div class="card">${body}</div></body></html>`
+}
+
+function claimFormHtml(): string {
+  return claimShell(
+    'Recover your API key — url-to-pdf',
+    `<h1>Recover your API key</h1>
+<p>Enter the email you used at checkout. Your key is sent to you instantly — no password needed.</p>
+<form method="get" action="/portal/claim">
+  <input type="email" name="email" placeholder="you@example.com" required>
+  <button type="submit">Get my key</button>
+</form>
+<p class="muted">Lost your key? It is bound to your email and is the same every time.</p>
+<a class="back" href="/">← Back</a>`,
+  )
+}
+
+function claimKeyHtml(email: string, key: string): string {
+  const safeEmail = email.replace(/</g, '&lt;')
+  const safeKey = key.replace(/</g, '&lt;')
+  return claimShell(
+    'Your API key — url-to-pdf',
+    `<h1>Your API key</h1>
+<p class="ok">Key for <code>${safeEmail}</code></p>
+<div class="keybox"><code id="k">${safeKey}</code><button id="cp">Copy</button></div>
+<p class="muted">Use it as <code>x-api-key</code> on /tools/* or in your MCP client. This same key is returned every time you recover it.</p>
+<a class="back" href="/">← Back</a>
+<script>var cp=document.getElementById('cp');if(cp)cp.addEventListener('click',function(){navigator.clipboard.writeText('${safeKey}').then(function(){cp.textContent='Copied';}).catch(function(){cp.textContent='Copy failed';});});</script>`,
+  )
+}
+
+function claimNotFoundHtml(email: string): string {
+  const safeEmail = email.replace(/</g, '&lt;')
+  return claimShell(
+    'No key found — url-to-pdf',
+    `<h1>No key for this email</h1>
+<p>We could not find an active key for <code>${safeEmail}</code>.</p>
+<p class="muted">Make sure you used this exact email at checkout, or <a class="link" href="/buy">complete a purchase</a> first.</p>
+<a class="back" href="/">← Back</a>`,
+  )
 }
 
 /** 本站自有收银台的路径 */
@@ -351,15 +435,21 @@ export function handleCheckoutPage(env: Env): Response {
 <title>Checkout — url-to-pdf</title>
 <style>
  body{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1a1a1a;background:#fafafa;display:flex;min-height:100vh;align-items:center;justify-content:center}
- .card{background:#fff;border:1px solid #ebebeb;border-radius:12px;padding:32px 28px;max-width:380px;width:calc(100% - 40px);text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+ .card{background:#fff;border:1px solid #ebebeb;border-radius:12px;padding:32px 28px;max-width:420px;width:calc(100% - 40px);text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.04)}
  h1{font-size:18px;margin:0 0 6px;font-weight:600}
  p{color:#666;margin:0 0 18px;font-size:14px}
+ .ok{color:#0a6}
  button{background:#0a6;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer}
  .err{color:#c0392b;font-size:13px;margin:14px 0 0}
  a.back{display:block;margin-top:16px;color:#888;font-size:13px;text-decoration:none}
+ .keybox{display:flex;gap:8px;align-items:center;justify-content:center;margin:6px 0 14px}
+ .keybox code{background:#f4f4f5;padding:8px 10px;border-radius:6px;font-size:13px;word-break:break-all;text-align:left}
+ .keybox button{background:#0a6;padding:8px 14px}
+ .muted{color:#888;font-size:13px}
+ a.link{color:#0a6}
 </style></head>
 <body>
-<div class="card">
+<div class="card" id="card">
   <h1>url-to-pdf</h1>
   <p id="msg">Opening secure Paddle checkout…</p>
   <button id="open" hidden>Open checkout</button>
@@ -374,6 +464,7 @@ export function handleCheckoutPage(env: Env): Response {
   var msg = document.getElementById('msg');
   var btn = document.getElementById('open');
   var err = document.getElementById('err');
+  var card = document.getElementById('card');
   function fail(t){ msg.hidden = true; err.hidden = false; err.textContent = t; btn.hidden = false; }
   if (!txn) { fail('Missing transaction id. Start again from /buy.'); return; }
   var ready = false;
@@ -390,6 +481,49 @@ export function handleCheckoutPage(env: Env): Response {
       initP.then(function(){ ready = true; open(); }).catch(function(e){ fail(String((e && e.message) || e)); });
     } else { ready = true; open(); }
   } catch (e) { fail('Paddle.js failed to load. Please retry.'); return; }
+
+  function getEmail(e){
+    return (e && (e.email || (e.checkout && e.checkout.email) || (e.customer && e.customer.email))) || '';
+  }
+  function showKey(key){
+    card.innerHTML = '<h1>Your API key</h1>' +
+      '<p class="ok">Payment received. Copy your key now and keep it safe.</p>' +
+      '<div class="keybox"><code id="k">' + String(key).replace(/</g,'&lt;') + '</code><button id="cp">Copy</button></div>' +
+      '<p class="muted">Use it as <code>x-api-key</code> on /tools/* or in your MCP client.<br>Lost it later? Recover at <a class="link" href="/portal/claim">/portal/claim</a> with your checkout email.</p>' +
+      '<a class="back" href="/">← Back</a>';
+    var cp = document.getElementById('cp');
+    if (cp) cp.addEventListener('click', function(){
+      navigator.clipboard.writeText(key).then(function(){ cp.textContent = 'Copied'; }).catch(function(){ cp.textContent = 'Copy failed'; });
+    });
+  }
+  function pollClaim(email){
+    if (!email) {
+      card.innerHTML = '<h1>Almost there</h1><p class="muted">We could not read your email from checkout. Recover your key at <a class="link" href="/portal/claim">/portal/claim</a> by entering the email you used to pay.</p><a class="back" href="/">← Back</a>';
+      return;
+    }
+    msg.textContent = 'Payment received — generating your key…';
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      fetch('/portal/claim?email=' + encodeURIComponent(email), { headers: { 'Accept': 'application/json' } })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (d && d.apiKey) { clearInterval(iv); msg.hidden = true; showKey(d.apiKey); }
+          else if (tries > 20) {
+            clearInterval(iv);
+            card.innerHTML = '<h1>Key not ready yet</h1><p class="muted">Your key will be ready shortly. Recover it at <a class="link" href="/portal/claim">/portal/claim</a> using email <code>' + email.replace(/</g,'&lt;') + '</code>.</p><a class="back" href="/">← Back</a>';
+          }
+        })
+        .catch(function(){
+          if (tries > 20) {
+            clearInterval(iv);
+            card.innerHTML = '<h1>Key not ready yet</h1><p class="muted">Recover your key at <a class="link" href="/portal/claim">/portal/claim</a> using email <code>' + email.replace(/</g,'&lt;') + '</code>.</p><a class="back" href="/">← Back</a>';
+          }
+        });
+    }, 1000);
+  }
+  try { Paddle.Checkout.Events.on('checkout.completed', function(e){ pollClaim(getEmail(e)); }); }
+  catch (e2) { /* older Paddle.js may not expose Events; key still recoverable via /portal/claim */ }
 })();
 </script>
 </body></html>`

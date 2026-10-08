@@ -8,9 +8,15 @@ import { renderAndStore, BusyError, type Kind } from './render'
  * 分工原因：付费是 API key 模型——用户先去 /buy 通过 Paddle 买 key，
  * 之后调用 /tools/* 时带 x-api-key。MCP 这边把工具的 HTTP 端点暴露出来，
  * 付费工具在 tools/call 时返回引导（去哪买、怎么带 key），由 agent 自己去打 HTTP 端点。
+ *
+ * 传输层：2025-06-18 Streamable HTTP（POST 收发 JSON-RPC、GET 开 SSE 流、DELETE 结束会话）。
+ * initialize 后回 Mcp-Session-Id；支持 SSE 响应；CORS 头由 corsHeaders() 统一附加。
+ * 本 Worker 无状态，session id 仅用于满足协议握手，不依赖服务端存储。
  */
 
 const PROTOCOL_VERSION = '2025-06-18'
+const SERVER_VERSION = '0.2.0'
+const SESSION_HEADER = 'mcp-session-id'
 
 type Json = Record<string, unknown>
 
@@ -120,56 +126,228 @@ function buildTools(env: Env): ToolDef[] {
   ]
 }
 
+// ---------------------------------------------------------------- 协议响应辅助
+
+export function corsHeaders(): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Authorization, x-api-key, Mcp-Session-Id, mcp-protocol-version',
+  }
+}
+
+function withSession(sid: string, extra: Record<string, string> = {}): Record<string, string> {
+  const h: Record<string, string> = { ...extra }
+  if (sid) h[SESSION_HEADER] = sid
+  return h
+}
+
+interface RpcReturn {
+  id: unknown
+  result?: Json
+  error?: { code: number; message: string }
+  sessionId?: string
+}
+
+function makeResponse(id: unknown, result: Json, sessionId?: string): RpcReturn {
+  return { id, result, sessionId }
+}
+
+function makeError(id: unknown, code: number, message: string): RpcReturn {
+  return { id, error: { code, message } }
+}
+
+/** 把 RPC 结果序列化；若客户端 Accept 含 text/event-stream 则用 SSE 回，否则 JSON。 */
+function serialize(ret: RpcReturn, accept: string, sid: string): Response {
+  const body = ret.error
+    ? { jsonrpc: '2.0', id: ret.id, error: ret.error }
+    : { jsonrpc: '2.0', id: ret.id, result: ret.result }
+  const headers = withSession(sid, corsHeaders())
+
+  if (accept.toLowerCase().includes('text/event-stream')) {
+    const data = JSON.stringify(body)
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: message\ndata: ${data}\n\n`))
+        controller.close()
+      },
+    })
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', ...headers },
+    })
+  }
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers },
+  })
+}
+
+// ---------------------------------------------------------------- 会话生命周期（GET SSE / DELETE）
+
+function sseStream(sid: string): Response {
+  const encoder = new TextEncoder()
+  let timer: ReturnType<typeof setInterval> | undefined
+  const stream = new ReadableStream({
+    start(controller) {
+      const c = controller as ReadableStreamDefaultController
+      c.enqueue(encoder.encode(': connected\n\n'))
+      timer = setInterval(() => {
+        try {
+          c.enqueue(encoder.encode(': heartbeat\n\n'))
+        } catch {
+          if (timer) clearInterval(timer)
+        }
+      }, 15000)
+    },
+    cancel() {
+      if (timer) clearInterval(timer)
+    },
+  })
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      ...withSession(sid, corsHeaders()),
+    },
+  })
+}
+
+// ---------------------------------------------------------------- 入口：按 HTTP 方法分发
+
 export async function handleMcp(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') {
-    return new Response('Only POST is supported on /mcp', { status: 405 })
+  const method = request.method
+  const accept = request.headers.get('accept') || ''
+  const sessionId = request.headers.get(SESSION_HEADER) || ''
+
+  if (method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders() })
+  }
+  if (method === 'DELETE') {
+    return new Response(null, { status: 204, headers: withSession(sessionId, corsHeaders()) })
+  }
+  if (method === 'GET') {
+    return sseStream(sessionId)
+  }
+  if (method !== 'POST') {
+    return new Response('Method not allowed', {
+      status: 405,
+      headers: withSession(sessionId, corsHeaders()),
+    })
   }
 
-  // 取 key 并校验一次，付费工具执行层复用（DISABLE_PAYWALL 时视为已授权，便于本地自测）
-  const authed =
-    paywallDisabled(env) || (await validateApiKey(env, extractApiKey(request)))
-
-  let body: Json
+  let raw: string
   try {
-    body = (await request.json()) as Json
+    raw = await request.text()
   } catch {
-    return rpcErr(null, -32700, 'Parse error')
+    return serialize(makeError(null, -32700, 'Failed to read body'), accept, sessionId)
   }
 
-  const id = body.id ?? null
-  const method = String(body.method ?? '')
-  const params = (body.params ?? {}) as Json
+  let parsed: any
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return serialize(makeError(null, -32700, 'Parse error'), accept, sessionId)
+  }
 
-  switch (method) {
-    case 'initialize':
-      return rpcOk(id, {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'url-to-pdf', version: '0.2.0' },
-      })
+  // 批量请求
+  if (Array.isArray(parsed)) {
+    const out: Json[] = []
+    for (const msg of parsed) {
+      const r = await dispatch(msg, request, env)
+      if (r !== null) out.push(rpcWire(r))
+    }
+    const payload = out.length
+      ? out
+      : ({ jsonrpc: '2.0', id: null, result: {} } as unknown as Json)
+    return serializeEnvelope(payload, accept, sessionId)
+  }
 
+  const r = await dispatch(parsed, request, env)
+  if (r === null) {
+    // 通知（无 id）→ 202 Accepted
+    return new Response(null, {
+      status: 202,
+      headers: withSession(sessionId, corsHeaders()),
+    })
+  }
+  return serialize(r, accept, r.sessionId ?? sessionId)
+}
+
+/** 把 RpcReturn 转成线上 JSON-RPC wire 对象 */
+function rpcWire(r: RpcReturn): Json {
+  return r.error
+    ? ({ jsonrpc: '2.0', id: r.id, error: r.error } as unknown as Json)
+    : ({ jsonrpc: '2.0', id: r.id, result: r.result } as unknown as Json)
+}
+
+/** 批量/枚举时直接包一层统一响应 */
+function serializeEnvelope(payload: Json | Json[], accept: string, sid: string): Response {
+  const headers = withSession(sid, corsHeaders())
+  if (accept.toLowerCase().includes('text/event-stream')) {
+    const data = JSON.stringify(payload)
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: message\ndata: ${data}\n\n`))
+        controller.close()
+      },
+    })
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', ...headers },
+    })
+  }
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers },
+  })
+}
+
+// ---------------------------------------------------------------- 单条消息分发
+
+async function dispatch(msg: any, request: Request, env: Env): Promise<RpcReturn | null> {
+  const id = msg?.id ?? null
+  const m = String(msg?.method ?? '')
+  const params = (msg?.params ?? {}) as Json
+
+  switch (m) {
+    case 'initialize': {
+      const sid = crypto.randomUUID()
+      return makeResponse(
+        id,
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'url-to-pdf', version: SERVER_VERSION },
+        },
+        sid,
+      )
+    }
     case 'notifications/initialized':
-      return new Response(null, { status: 202 })
-
+      return null
+    case 'ping':
+      return makeResponse(id, {} as Json)
     case 'tools/list':
-      return rpcOk(id, {
+      return makeResponse(id, {
         tools: buildTools(env).map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: t.inputSchema,
         })),
       })
-
-    case 'tools/call':
+    case 'tools/call': {
+      const authed =
+        paywallDisabled(env) || (await validateApiKey(env, extractApiKey(request)))
       return await callTool(id, String(params.name ?? ''), (params.arguments ?? {}) as Json, env, authed)
-
-    case 'ping':
-      return rpcOk(id, {} as Json)
-
+    }
     default:
-      return rpcErr(id, -32601, `Method not found: ${method}`)
+      return makeError(id, -32601, `Method not found: ${m}`)
   }
 }
+
+// ---------------------------------------------------------------- 工具执行
 
 async function callTool(
   id: unknown,
@@ -177,15 +355,15 @@ async function callTool(
   args: Json,
   env: Env,
   authed: boolean,
-): Promise<Response> {
+): Promise<RpcReturn> {
   const tool = buildTools(env).find((t) => t.name === name)
-  if (!tool) return rpcErr(id, -32602, `Unknown tool: ${name}`)
+  if (!tool) return makeError(id, -32602, `Unknown tool: ${name}`)
 
   if (tool.kind === 'free') {
-    if (name !== 'list_capabilities') return rpcErr(id, -32602, `Unknown tool: ${name}`)
+    if (name !== 'list_capabilities') return makeError(id, -32602, `Unknown tool: ${name}`)
 
     const origin = srvOrigin(env)
-    return rpcOk(id, {
+    return makeResponse(id, {
       content: [
         {
           type: 'text',
@@ -214,10 +392,9 @@ async function callTool(
     })
   }
 
-  // 付费工具：未授权只返回购买引导；已授权则直接渲染并返回下载链接
   const origin = srvOrigin(env)
   if (!authed || !tool.renderKind) {
-    return rpcOk(id, {
+    return makeResponse(id, {
       isError: true,
       content: [
         {
@@ -240,7 +417,7 @@ async function callTool(
 
   try {
     const out = await renderAndStore(env, tool.renderKind, args as Record<string, any>, origin)
-    return rpcOk(id, {
+    return makeResponse(id, {
       content: [
         {
           type: 'text',
@@ -250,7 +427,7 @@ async function callTool(
     })
   } catch (err) {
     if (err instanceof BusyError) {
-      return rpcOk(id, {
+      return makeResponse(id, {
         isError: true,
         content: [
           {
@@ -270,7 +447,7 @@ async function callTool(
       })
     }
     const detail = err instanceof Error ? err.message : String(err)
-    return rpcOk(id, {
+    return makeResponse(id, {
       isError: true,
       content: [
         {
@@ -280,12 +457,4 @@ async function callTool(
       ],
     })
   }
-}
-
-function rpcOk(id: unknown, result: Json) {
-  return Response.json({ jsonrpc: '2.0', id, result })
-}
-
-function rpcErr(id: unknown, code: number, message: string) {
-  return Response.json({ jsonrpc: '2.0', id, error: { code, message } })
 }
