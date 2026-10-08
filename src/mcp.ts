@@ -1,5 +1,6 @@
 import type { Env } from './env'
 import { listPaidEndpoints, extractApiKey, validateApiKey, paywallDisabled } from './pay'
+import { checkRateLimit } from './limit'
 import { renderAndStore, BusyError, type Kind } from './render'
 
 /**
@@ -338,8 +339,29 @@ async function dispatch(msg: any, request: Request, env: Env): Promise<RpcReturn
         })),
       })
     case 'tools/call': {
-      const authed =
-        paywallDisabled(env) || (await validateApiKey(env, extractApiKey(request)))
+      const apiKey = extractApiKey(request)
+      const authed = paywallDisabled(env) || (await validateApiKey(env, apiKey))
+      // 按 key 限流：付费工具通过鉴权后再检查每日/每分钟额度
+      const rl = await checkRateLimit(env, authed ? apiKey : null)
+      if (authed && !rl.ok) {
+        return makeResponse(id, {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  error: rl.code,
+                  message: rl.message,
+                  retryAfterSeconds: rl.retryAfterSeconds,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        })
+      }
       return await callTool(id, String(params.name ?? ''), (params.arguments ?? {}) as Json, env, authed)
     }
     default:

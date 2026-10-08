@@ -38,4 +38,9 @@ export interface Env {
 
   /** 本地自测用，生产环境不要开 */
   DISABLE_PAYWALL?: string
+
+  /** 单个 API key 每日渲染额度（默认 50），防一个用户吃光共享渲染额度 */
+  DAILY_LIMIT?: string
+  /** 单个 API key 每分钟突发上限（默认 10），防瞬间起一堆浏览器撞免费实例墙 */
+  PER_MIN_LIMIT?: string
 }

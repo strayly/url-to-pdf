@@ -9,6 +9,7 @@
  */
 
 import type { Env } from './env'
+import { checkRateLimit } from './limit'
 
 export interface EndpointPrice {
   route: string
@@ -99,6 +100,19 @@ export function requireApiKey() {
           hint: 'Send it as "Authorization: Bearer <key>" or "x-api-key: <key>".',
         },
         401,
+      )
+    }
+    // 按 key 限流：每日额度 + 每分钟突发，防单个用户吃光共享渲染额度
+    const rl = await checkRateLimit(c.env, key)
+    if (!rl.ok) {
+      return c.json(
+        {
+          error: rl.code,
+          message: rl.message,
+          retryAfterSeconds: rl.retryAfterSeconds,
+        },
+        429,
+        { 'Retry-After': String(rl.retryAfterSeconds ?? 60) },
       )
     }
     return next()

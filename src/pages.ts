@@ -78,7 +78,7 @@ export function landingPage(origin: string): string {
 <pre>${curl}</pre>
 <p>Or connect it as an MCP server (works with Claude Desktop, Cursor, and any MCP client that supports Streamable HTTP):</p>
 <pre>${mcp}</pre>
-<p class="muted">Fair-use note: rendering runs on Cloudflare Browser Rendering. Under the free tier, short bursts of heavy concurrent load may be briefly rate-limited (HTTP 429) — just retry in a few seconds.</p>`,
+<p class="muted">Fair-use limits keep the service fast for everyone: each API key may convert up to <strong>50 pages per day</strong> and <strong>10 per minute</strong>. If you hit a limit you'll get a clear <code>429</code> with a reset time — wait a moment and retry. Rendering runs on Cloudflare Browser Rendering; brief <code>429</code>s under heavy concurrent load also self-clear in a few seconds.</p>`,
   )
 }
 
@@ -202,6 +202,7 @@ export function termsPage(): string {
 <ul>
 <li>The Service is billed at <span class="price">$5 / month</span>, recurring, via Paddle. It renews automatically each month until cancelled from your Paddle customer portal. Plan price and currency are shown at checkout.</li>
 <li>Prices and features are shown on the purchase page; future renewals are at the then-current price, which Paddle notifies you about where required by law.</li>
+<li>Use is subject to a fair-use rate limit per API key (currently up to 50 conversions per day and 10 per minute). Limits exist to keep the shared service fast for all customers and may be adjusted over time; sustained abuse may result in throttling or termination of the key under the Acceptable Use section.</li>
 </ul>
 
 <h2>9. Refunds</h2>
