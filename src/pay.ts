@@ -254,6 +254,14 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     const paddleId = String(data?.subscription_id || data?.id || '')
     if (email) {
       const key = await issueKey(env, email, paddleId, type)
+      // 记录 transaction id -> 邮箱：付款页万一只拿到 txn（读不到邮箱）也能直接领 key。
+      // 30 天后自动过期，不影响 key 本身（key 永久有效）。
+      const txnId = String(data?.transaction_id || data?.id || '')
+      if (txnId.startsWith('txn_')) {
+        await env.KEYS.put(`txn:${txnId}`, email.toLowerCase().trim(), {
+          expirationTtl: 60 * 60 * 24 * 30,
+        })
+      }
       // 订阅状态变化：非 active 就停用 key
       if (type === 'subscription.updated' && data?.status && data.status !== 'active') {
         await deactivateKey(env, key)
@@ -264,33 +272,53 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
   return new Response('ok', { status: 200 })
 }
 
-/** 支付完成后，用户凭邮箱自助领取 key。邮箱即账号，可无限次重领（幂等）。 */
+/**
+ * 支付完成后，用户自助领取 key。两种入口，都是幂等的：
+ *  - ?email=...  付款用的邮箱（邮箱即账号，可无限次重领）
+ *  - ?txn=...    这笔 Paddle 交易 id；发卡时服务端记了 txn->email，前端读不到邮箱时也能领
+ */
 export async function handleClaim(request: Request, env: Env): Promise<Response> {
   const u = new URL(request.url)
-  const email = (u.searchParams.get('email') || '').trim()
+  const txn = (u.searchParams.get('txn') || '').trim()
+  let email = (u.searchParams.get('email') || '').trim()
   const accept = request.headers.get('accept') || ''
   const wantsJson =
     accept.toLowerCase().includes('application/json') ||
     request.headers.get('x-requested-with') === 'fetch'
 
+  // 只给了 transaction id：用服务端记的映射反查邮箱
+  if (!email && txn) {
+    const mapped = await env.KEYS.get(`txn:${txn}`)
+    if (mapped) email = mapped
+  }
+
   if (!email) {
     if (wantsJson) {
-      return json({ error: 'email_required', message: 'Pass ?email=you@example.com used at checkout.' }, 400)
+      return json(
+        {
+          error: txn ? 'pending' : 'email_required',
+          message: txn
+            ? 'Key not issued yet — the payment webhook is still being processed.'
+            : 'Pass ?email=you@example.com used at checkout.',
+        },
+        txn ? 404 : 400,
+      )
     }
     return new Response(claimFormHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
     })
   }
 
-  const key = await env.KEYS.get(`cust:${email.toLowerCase()}`)
+  const norm = email.toLowerCase()
+  const key = await env.KEYS.get(`cust:${norm}`)
   if (!key) {
     if (wantsJson) {
       return json(
-        { error: 'no_key', message: 'No active key for this email. Complete a purchase first.' },
+        { error: 'no_key', message: 'No active key for this email yet. Complete a purchase first.' },
         404,
       )
     }
-    return new Response(claimNotFoundHtml(email), {
+    return new Response(claimNotFoundHtml(norm), {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
     })
   }
@@ -298,10 +326,13 @@ export async function handleClaim(request: Request, env: Env): Promise<Response>
   if (wantsJson) {
     return json({
       apiKey: key,
+      email: norm,
+      mcpUrl: `${(env.WORKER_ORIGIN || '').replace(/\/$/, '')}/mcp`,
       note: 'Use it as "Authorization: Bearer <key>" or "x-api-key: <key>" on /tools/* and /mcp.',
     })
   }
-  return new Response(claimKeyHtml(email, key), {
+  const origin = (env.WORKER_ORIGIN || new URL(request.url).origin).replace(/\/$/, '')
+  return new Response(claimKeyHtml(norm, key, origin), {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
   })
 }
@@ -322,6 +353,7 @@ function claimShell(title: string, body: string): string {
  .keybox{display:flex;gap:8px;align-items:center;justify-content:center;margin:8px 0 14px}
  .keybox code{background:#f4f4f5;padding:8px 10px;border-radius:6px;font-size:13px;word-break:break-all;text-align:left}
  .keybox button{background:#0a6;padding:8px 14px}
+ pre{background:#f4f4f5;border-radius:8px;padding:12px;font-size:12px;overflow:auto;text-align:left;margin:0 0 12px;white-space:pre-wrap;word-break:break-all}
  .muted{color:#888;font-size:13px}
  a.link{color:#0a6}
  a.back{display:block;margin-top:16px;color:#888;font-size:13px;text-decoration:none}
@@ -343,17 +375,42 @@ function claimFormHtml(): string {
   )
 }
 
-function claimKeyHtml(email: string, key: string): string {
+/** 生成可直接粘贴到 MCP 客户端的配置片段（key 已填好，用户零手改） */
+export function configSnippet(origin: string, key: string): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        'url-to-pdf': {
+          type: 'http',
+          url: `${origin.replace(/\/$/, '')}/mcp`,
+          headers: { 'x-api-key': key },
+        },
+      },
+    },
+    null,
+    2,
+  )
+}
+
+function claimKeyHtml(email: string, key: string, origin: string): string {
   const safeEmail = email.replace(/</g, '&lt;')
   const safeKey = key.replace(/</g, '&lt;')
+  const safeSnippet = configSnippet(origin, key).replace(/</g, '&lt;')
   return claimShell(
     'Your API key — url-to-pdf',
     `<h1>Your API key</h1>
 <p class="ok">Key for <code>${safeEmail}</code></p>
-<div class="keybox"><code id="k">${safeKey}</code><button id="cp">Copy</button></div>
-<p class="muted">Use it as <code>x-api-key</code> on /tools/* or in your MCP client. This same key is returned every time you recover it.</p>
+<div class="keybox"><code id="k">${safeKey}</code><button id="cp">Copy key</button></div>
+<p class="muted" style="text-align:left">Paste this into your MCP client config:</p>
+<pre id="snip">${safeSnippet}</pre>
+<button id="cpsnip">Copy config</button>
+<p class="muted">This same key comes back every time you recover it. Lost it? Just revisit this page.</p>
 <a class="back" href="/">← Back</a>
-<script>var cp=document.getElementById('cp');if(cp)cp.addEventListener('click',function(){navigator.clipboard.writeText('${safeKey}').then(function(){cp.textContent='Copied';}).catch(function(){cp.textContent='Copy failed';});});</script>`,
+<script>
+function _cp(t,b,ok){navigator.clipboard.writeText(t).then(function(){b.textContent=ok;}).catch(function(){b.textContent='Copy failed';});}
+var cp=document.getElementById('cp');if(cp)cp.addEventListener('click',function(){_cp(${JSON.stringify(key)},cp,'Copied');});
+var cs=document.getElementById('cpsnip');if(cs)cs.addEventListener('click',function(){_cp(document.getElementById('snip').textContent,cs,'Copied');});
+</script>`,
   )
 }
 
@@ -467,6 +524,7 @@ export function handleCheckoutPage(env: Env): Response {
  .keybox code{background:#f4f4f5;padding:8px 10px;border-radius:6px;font-size:13px;word-break:break-all;text-align:left}
  .keybox button{background:#0a6;padding:8px 14px}
  .muted{color:#888;font-size:13px}
+ pre{background:#f4f4f5;border-radius:8px;padding:12px;font-size:12px;overflow:auto;text-align:left;margin:0 0 12px;white-space:pre-wrap;word-break:break-all}
  a.link{color:#0a6}
 </style></head>
 <body>
@@ -482,10 +540,12 @@ export function handleCheckoutPage(env: Env): Response {
 (function(){
   var q = new URLSearchParams(location.search);
   var txn = q.get('_ptxn') || q.get('txn');
+  var origin = location.origin;
   var msg = document.getElementById('msg');
   var btn = document.getElementById('open');
   var err = document.getElementById('err');
   var card = document.getElementById('card');
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
   function fail(t){ msg.hidden = true; err.hidden = false; err.textContent = t; btn.hidden = false; }
   if (!txn) { fail('Missing transaction id. Start again from /buy.'); return; }
   var ready = false;
@@ -495,56 +555,68 @@ export function handleCheckoutPage(env: Env): Response {
     catch (e) { fail(String((e && e.message) || e)); }
   }
   btn.addEventListener('click', open);
+
+  function copy(text, b, done){
+    navigator.clipboard.writeText(text).then(function(){ b.textContent = done; })
+      .catch(function(){ b.textContent = 'Copy failed'; });
+  }
+  function showKey(key){
+    var snippet = JSON.stringify({ mcpServers: { 'url-to-pdf': { type: 'http', url: origin + '/mcp', headers: { 'x-api-key': key } } } }, null, 2);
+    card.innerHTML =
+      '<h1>Payment received</h1>' +
+      '<p class="ok">Here is your API key. It is tied to your email, so you can recover it any time.</p>' +
+      '<div class="keybox"><code id="k">' + esc(key) + '</code><button id="cp">Copy key</button></div>' +
+      '<p class="muted" style="text-align:left">Add this to your MCP client config:</p>' +
+      '<pre id="snip">' + esc(snippet) + '</pre>' +
+      '<button id="cpsnip">Copy config</button>' +
+      '<p class="muted">Then just ask your AI, e.g. <em>"Save https://example.com as a PDF."</em><br>Lost the key? Recover it at <a class="link" href="/portal/claim">/portal/claim</a>.</p>' +
+      '<a class="back" href="/">← Back</a>';
+    var b1 = document.getElementById('cp');
+    if (b1) b1.addEventListener('click', function(){ copy(key, b1, 'Copied'); });
+    var b2 = document.getElementById('cpsnip');
+    if (b2) b2.addEventListener('click', function(){ copy(snippet, b2, 'Copied'); });
+    try { navigator.clipboard.writeText(key); } catch (e) {}
+  }
+  function notReady(email, tx){
+    var via = email ? 'email <code>' + esc(email) + '</code>' : 'your recent purchase';
+    card.innerHTML = '<h1>Almost there</h1><p class="muted">Your key is still being generated. Recover it at <a class="link" href="/portal/claim">/portal/claim</a> using ' + via + '.</p><a class="back" href="/">← Back</a>';
+  }
+  function fetchKey(qs){
+    return fetch('/portal/claim?' + qs, { headers: { 'Accept': 'application/json' } }).then(function(r){ return r.json(); });
+  }
+  function pollClaim(email, tx){
+    var tries = 0, max = 25;
+    msg.hidden = false; err.hidden = true; msg.textContent = 'Payment received — generating your key…';
+    var iv = setInterval(function(){
+      tries++;
+      var p = Promise.resolve(null);
+      if (tx) p = p.then(function(){ return fetchKey('txn=' + encodeURIComponent(tx)); });
+      p = p.then(function(d){
+        if (d && d.apiKey) return d;
+        if (email) return fetchKey('email=' + encodeURIComponent(email));
+        return d;
+      });
+      p.then(function(d){
+        if (d && d.apiKey) { clearInterval(iv); msg.hidden = true; showKey(d.apiKey); }
+        else if (tries >= max) { clearInterval(iv); notReady(email, tx); }
+      }).catch(function(){ if (tries >= max) { clearInterval(iv); notReady(email, tx); } });
+    }, 1200);
+  }
+  function onEvent(ev){
+    if (!ev || ev.name !== 'checkout.completed') return;
+    var d = ev.data || {};
+    var em = (d.customer && d.customer.email) || '';
+    var tx = d.transaction_id || txn;
+    try { if (Paddle.Checkout && Paddle.Checkout.close) Paddle.Checkout.close(); } catch (e) {}
+    pollClaim(em, tx);
+  }
   try {
     ${envSet}
-    var initP = Paddle.Initialize({ token: ${jsToken} });
+    var initP = Paddle.Initialize({ token: ${jsToken}, eventCallback: onEvent });
     if (initP && typeof initP.then === 'function') {
       initP.then(function(){ ready = true; open(); }).catch(function(e){ fail(String((e && e.message) || e)); });
     } else { ready = true; open(); }
   } catch (e) { fail('Paddle.js failed to load. Please retry.'); return; }
-
-  function getEmail(e){
-    return (e && (e.email || (e.checkout && e.checkout.email) || (e.customer && e.customer.email))) || '';
-  }
-  function showKey(key){
-    card.innerHTML = '<h1>Your API key</h1>' +
-      '<p class="ok">Payment received. Copy your key now and keep it safe.</p>' +
-      '<div class="keybox"><code id="k">' + String(key).replace(/</g,'&lt;') + '</code><button id="cp">Copy</button></div>' +
-      '<p class="muted">Use it as <code>x-api-key</code> on /tools/* or in your MCP client.<br>Lost it later? Recover at <a class="link" href="/portal/claim">/portal/claim</a> with your checkout email.</p>' +
-      '<a class="back" href="/">← Back</a>';
-    var cp = document.getElementById('cp');
-    if (cp) cp.addEventListener('click', function(){
-      navigator.clipboard.writeText(key).then(function(){ cp.textContent = 'Copied'; }).catch(function(){ cp.textContent = 'Copy failed'; });
-    });
-  }
-  function pollClaim(email){
-    if (!email) {
-      card.innerHTML = '<h1>Almost there</h1><p class="muted">We could not read your email from checkout. Recover your key at <a class="link" href="/portal/claim">/portal/claim</a> by entering the email you used to pay.</p><a class="back" href="/">← Back</a>';
-      return;
-    }
-    msg.textContent = 'Payment received — generating your key…';
-    var tries = 0;
-    var iv = setInterval(function(){
-      tries++;
-      fetch('/portal/claim?email=' + encodeURIComponent(email), { headers: { 'Accept': 'application/json' } })
-        .then(function(r){ return r.json(); })
-        .then(function(d){
-          if (d && d.apiKey) { clearInterval(iv); msg.hidden = true; showKey(d.apiKey); }
-          else if (tries > 20) {
-            clearInterval(iv);
-            card.innerHTML = '<h1>Key not ready yet</h1><p class="muted">Your key will be ready shortly. Recover it at <a class="link" href="/portal/claim">/portal/claim</a> using email <code>' + email.replace(/</g,'&lt;') + '</code>.</p><a class="back" href="/">← Back</a>';
-          }
-        })
-        .catch(function(){
-          if (tries > 20) {
-            clearInterval(iv);
-            card.innerHTML = '<h1>Key not ready yet</h1><p class="muted">Recover your key at <a class="link" href="/portal/claim">/portal/claim</a> using email <code>' + email.replace(/</g,'&lt;') + '</code>.</p><a class="back" href="/">← Back</a>';
-          }
-        });
-    }, 1000);
-  }
-  try { Paddle.Checkout.Events.on('checkout.completed', function(e){ pollClaim(getEmail(e)); }); }
-  catch (e2) { /* older Paddle.js may not expose Events; key still recoverable via /portal/claim */ }
 })();
 </script>
 </body></html>`
