@@ -292,6 +292,11 @@ export async function handleClaim(request: Request, env: Env): Promise<Response>
     if (mapped) email = mapped
   }
 
+  const htmlHeaders = {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  }
+
   if (!email) {
     if (wantsJson) {
       return json(
@@ -304,9 +309,10 @@ export async function handleClaim(request: Request, env: Env): Promise<Response>
         txn ? 404 : 400,
       )
     }
-    return new Response(claimFormHtml(), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-    })
+    // 付款刚完成时 Paddle 会把用户送到 ?txn=…，此刻 webhook 往往还在路上。
+    // 这时给一个会自动刷新的等待页，别让用户误以为"没发卡"。
+    if (txn) return new Response(claimPendingHtml(txn), { headers: htmlHeaders })
+    return new Response(claimFormHtml(), { headers: htmlHeaders })
   }
 
   const norm = email.toLowerCase()
@@ -318,9 +324,9 @@ export async function handleClaim(request: Request, env: Env): Promise<Response>
         404,
       )
     }
-    return new Response(claimNotFoundHtml(norm), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-    })
+    // txn 已登记但卡还没落地（webhook 处理中）→ 自动刷新等待页
+    if (txn) return new Response(claimPendingHtml(txn), { headers: htmlHeaders })
+    return new Response(claimNotFoundHtml(norm), { headers: htmlHeaders })
   }
 
   if (wantsJson) {
@@ -332,9 +338,7 @@ export async function handleClaim(request: Request, env: Env): Promise<Response>
     })
   }
   const origin = (env.WORKER_ORIGIN || new URL(request.url).origin).replace(/\/$/, '')
-  return new Response(claimKeyHtml(norm, key, origin), {
-    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-  })
+  return new Response(claimKeyHtml(norm, key, origin), { headers: htmlHeaders })
 }
 
 function claimShell(title: string, body: string): string {
@@ -422,6 +426,38 @@ function claimNotFoundHtml(email: string): string {
 <p>We could not find an active key for <code>${safeEmail}</code>.</p>
 <p class="muted">Make sure you used this exact email at checkout, or <a class="link" href="/buy">complete a purchase</a> first.</p>
 <a class="back" href="/">← Back</a>`,
+  )
+}
+
+/**
+ * 付款刚落地的过渡页：webhook 还在处理、key 尚未写入时显示，页面自己轮询，
+ * 一旦服务端有了 key 就整页刷新成正式的 key 页。用户无需任何操作。
+ */
+function claimPendingHtml(txn: string): string {
+  const jTxn = JSON.stringify(txn)
+  return claimShell(
+    'Finalizing your key — url-to-pdf',
+    `<h1>Finishing up…</h1>
+<p>Payment received. Your API key is being generated — this page updates by itself.</p>
+<p class="muted" id="st">Waiting for confirmation…</p>
+<a class="back" href="/">← Back</a>
+<script>
+(function(){
+  var n = 0, url = '/portal/claim?txn=' + encodeURIComponent(${jTxn});
+  function tick(){
+    n++;
+    fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (d && d.apiKey) { location.replace(url); return; }
+        if (n >= 40) { document.getElementById('st').textContent = 'Still pending. Reload this page in a moment, or recover your key by email at /portal/claim.'; return; }
+        setTimeout(tick, 1500);
+      })
+      .catch(function(){ if (n < 40) setTimeout(tick, 1500); });
+  }
+  tick();
+})();
+</script>`,
   )
 }
 
@@ -520,12 +556,7 @@ export function handleCheckoutPage(env: Env): Response {
  button{background:#0a6;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer}
  .err{color:#c0392b;font-size:13px;margin:14px 0 0}
  a.back{display:block;margin-top:16px;color:#888;font-size:13px;text-decoration:none}
- .keybox{display:flex;gap:8px;align-items:center;justify-content:center;margin:6px 0 14px}
- .keybox code{background:#f4f4f5;padding:8px 10px;border-radius:6px;font-size:13px;word-break:break-all;text-align:left}
- .keybox button{background:#0a6;padding:8px 14px}
  .muted{color:#888;font-size:13px}
- pre{background:#f4f4f5;border-radius:8px;padding:12px;font-size:12px;overflow:auto;text-align:left;margin:0 0 12px;white-space:pre-wrap;word-break:break-all}
- a.link{color:#0a6}
 </style></head>
 <body>
 <div class="card" id="card">
@@ -540,76 +571,57 @@ export function handleCheckoutPage(env: Env): Response {
 (function(){
   var q = new URLSearchParams(location.search);
   var txn = q.get('_ptxn') || q.get('txn');
-  var origin = location.origin;
   var msg = document.getElementById('msg');
   var btn = document.getElementById('open');
   var err = document.getElementById('err');
-  var card = document.getElementById('card');
-  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
   function fail(t){ msg.hidden = true; err.hidden = false; err.textContent = t; btn.hidden = false; }
   if (!txn) { fail('Missing transaction id. Start again from /buy.'); return; }
+
+  // 付款成功后落地的页面：key 展示页（webhook 一到就绪）
+  var claimUrl = location.origin + '/portal/claim?txn=' + encodeURIComponent(txn);
+  var leaving = false;
+  function goClaim(){
+    if (leaving) return;
+    leaving = true;
+    try { if (window.Paddle && Paddle.Checkout && Paddle.Checkout.close) Paddle.Checkout.close(); } catch (e) {}
+    setTimeout(function(){ location.replace(claimUrl); }, 200);
+  }
+
   var ready = false;
   function open(){
     if (!ready) { setTimeout(open, 200); return; }
-    try { Paddle.Checkout.open({ transactionId: txn }); msg.hidden = false; err.hidden = true; }
-    catch (e) { fail(String((e && e.message) || e)); }
+    try {
+      Paddle.Checkout.open({
+        transactionId: txn,
+        settings: {
+          displayMode: 'overlay',
+          // 官方推荐的"付完自动跳走"开关：不依赖浮层自动关闭，也不依赖事件上报
+          successUrl: claimUrl
+        }
+      });
+      msg.hidden = false; err.hidden = true;
+    } catch (e) { fail(String((e && e.message) || e)); }
   }
   btn.addEventListener('click', open);
 
-  function copy(text, b, done){
-    navigator.clipboard.writeText(text).then(function(){ b.textContent = done; })
-      .catch(function(){ b.textContent = 'Copy failed'; });
-  }
-  function showKey(key){
-    var snippet = JSON.stringify({ mcpServers: { 'url-to-pdf': { type: 'http', url: origin + '/mcp', headers: { 'x-api-key': key } } } }, null, 2);
-    card.innerHTML =
-      '<h1>Payment received</h1>' +
-      '<p class="ok">Here is your API key. It is tied to your email, so you can recover it any time.</p>' +
-      '<div class="keybox"><code id="k">' + esc(key) + '</code><button id="cp">Copy key</button></div>' +
-      '<p class="muted" style="text-align:left">Add this to your MCP client config:</p>' +
-      '<pre id="snip">' + esc(snippet) + '</pre>' +
-      '<button id="cpsnip">Copy config</button>' +
-      '<p class="muted">Then just ask your AI, e.g. <em>"Save https://example.com as a PDF."</em><br>Lost the key? Recover it at <a class="link" href="/portal/claim">/portal/claim</a>.</p>' +
-      '<a class="back" href="/">← Back</a>';
-    var b1 = document.getElementById('cp');
-    if (b1) b1.addEventListener('click', function(){ copy(key, b1, 'Copied'); });
-    var b2 = document.getElementById('cpsnip');
-    if (b2) b2.addEventListener('click', function(){ copy(snippet, b2, 'Copied'); });
-    try { navigator.clipboard.writeText(key); } catch (e) {}
-  }
-  function notReady(email, tx){
-    var via = email ? 'email <code>' + esc(email) + '</code>' : 'your recent purchase';
-    card.innerHTML = '<h1>Almost there</h1><p class="muted">Your key is still being generated. Recover it at <a class="link" href="/portal/claim">/portal/claim</a> using ' + via + '.</p><a class="back" href="/">← Back</a>';
-  }
-  function fetchKey(qs){
-    return fetch('/portal/claim?' + qs, { headers: { 'Accept': 'application/json' } }).then(function(r){ return r.json(); });
-  }
-  function pollClaim(email, tx){
-    var tries = 0, max = 25;
-    msg.hidden = false; err.hidden = true; msg.textContent = 'Payment received — generating your key…';
-    var iv = setInterval(function(){
-      tries++;
-      var p = Promise.resolve(null);
-      if (tx) p = p.then(function(){ return fetchKey('txn=' + encodeURIComponent(tx)); });
-      p = p.then(function(d){
-        if (d && d.apiKey) return d;
-        if (email) return fetchKey('email=' + encodeURIComponent(email));
-        return d;
-      });
-      p.then(function(d){
-        if (d && d.apiKey) { clearInterval(iv); msg.hidden = true; showKey(d.apiKey); }
-        else if (tries >= max) { clearInterval(iv); notReady(email, tx); }
-      }).catch(function(){ if (tries >= max) { clearInterval(iv); notReady(email, tx); } });
-    }, 1200);
-  }
+  // 兜底一：生命周期事件。某些情况下 successUrl 不生效，这里补一刀。
   function onEvent(ev){
     if (!ev || ev.name !== 'checkout.completed') return;
-    var d = ev.data || {};
-    var em = (d.customer && d.customer.email) || '';
-    var tx = d.transaction_id || txn;
-    try { if (Paddle.Checkout && Paddle.Checkout.close) Paddle.Checkout.close(); } catch (e) {}
-    pollClaim(em, tx);
+    goClaim();
   }
+
+  // 兜底二：后台轮询。只要服务端已发卡就跳走 —— 与浮层关不关、事件上不上报完全解耦。
+  (function watch(n){
+    if (leaving || n > 100) return;
+    fetch(claimUrl, { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (d && d.apiKey) { goClaim(); return; }
+        setTimeout(function(){ watch(n + 1); }, 3000);
+      })
+      .catch(function(){ setTimeout(function(){ watch(n + 1); }, 3000); });
+  })(0);
+
   try {
     ${envSet}
     var initP = Paddle.Initialize({ token: ${jsToken}, eventCallback: onEvent });
